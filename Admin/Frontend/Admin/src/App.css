@@ -1,0 +1,90 @@
+@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Syne:wght@500;700;800&display=swap');
+
+* {
+  box-sizing: border-box;
+}
+
+:root {
+  --bg: #090909;
+  --bg-soft: #11120f;
+  --surface: rgba(20, 19, 17, 0.74);
+  --surface-strong: rgba(31, 29, 26, 0.92);
+  --surface-bright: rgba(255, 248, 236, 0.08);
+  --line: rgba(255, 244, 227, 0.12);
+  --line-strong: rgba(255, 244, 227, 0.24);
+  --text: #fff8ec;
+  --text-dim: rgba(255, 248, 236, 0.72);
+  --text-soft: rgba(255, 248, 236, 0.46);
+  --cyan: #7ef2d0;
+  --violet: #ff7b54;
+  --emerald: #d4ff61;
+  --amber: #ffbd59;
+  --rose: #ff6f91;
+  --shadow-xl: 0 42px 130px rgba(0, 0, 0, 0.42);
+  --shadow-lg: 0 22px 80px rgba(0, 0, 0, 0.36);
+  --radius-xl: 30px;
+  --radius-lg: 22px;
+  --radius-md: 16px;
+  --radius-sm: 12px;
+  --content-width: 1440px;
+  font-family: 'Manrope', sans-serif;
+  color: var(--text);
+  background:
+    radial-gradient(circle at 14% 10%, rgba(255, 123, 84, 0.08), transparent 28%),
+    radial-gradient(circle at 88% 18%, rgba(126, 242, 208, 0.07), transparent 26%),
+    linear-gradient(180deg, #090909 0%, #0d0d0c 42%, #11110f 100%);
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background:
+    radial-gradient(circle at top, rgba(255, 123, 84, 0.08), transparent 24%),
+    linear-gradient(180deg, #090909 0%, #10100f 100%);
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+button {
+  border: 0;
+}
+
+h1,
+h2,
+h3,
+p,
+button,
+label,
+input,
+select,
+td,
+th,
+span,
+strong {
+  word-break: keep-all;
+  overflow-wrap: break-word;
+}
+
+h1,
+h2,
+h3 {
+  text-wrap: balance;
+}
+
+p,
+td,
+th,
+label,
+span {
+  text-wrap: pretty;
+}

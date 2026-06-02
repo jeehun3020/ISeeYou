@@ -7,6 +7,7 @@
   type CSSProperties,
   type Dispatch,
   type DragEvent,
+  type MouseEvent,
   type ReactNode,
   type SetStateAction,
 } from 'react'
@@ -23,6 +24,7 @@ const BRAND_MODEL_SRC = '/iseeyou-logo.glb'
 const FREQUENCY_REFERENCE_PANEL_SRC = '/xai_refs/frequency_reference_panel.png'
 
 type CategoryId = 'image' | 'text' | 'video' | 'multimodal'
+type DeveloperOverrideTarget = 'real' | 'fake'
 type View = { screen: 'home' } | { screen: 'studio'; category: CategoryId }
 type UploadKind = 'image' | 'text' | 'video'
 
@@ -94,6 +96,13 @@ type Analysis = {
   llmSections?: { heatmap: string; timeline: string; fusion: string; frequency: string }
   textLlmSections?: { userGuide: string; sentenceInterpretation: string; tip: string }
   videoXai?: VideoXai
+  developerOverride?: {
+    target: DeveloperOverrideTarget
+    applied: boolean
+    originalVerdictLabel: string
+    originalFakePercent: number
+    originalRealPercent: number
+  }
 }
 
 type ApiAnalysis = {
@@ -537,8 +546,138 @@ function syncHash(view: View) {
   }
 }
 
+function getUsageSessionId() {
+  const key = 'isy_usage_session_id'
+  const existing = window.sessionStorage.getItem(key)
+  if (existing) return existing
+  const next = window.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`
+  window.sessionStorage.setItem(key, next)
+  return next
+}
+
+function trackUsageEvent(eventType: string, payload: {
+  page?: string
+  modality?: string
+  modelName?: string
+  status?: string
+  detail?: Record<string, unknown>
+} = {}) {
+  const eventPayload = {
+    sessionId: getUsageSessionId(),
+    eventType,
+    page: payload.page,
+    modality: payload.modality,
+    modelName: payload.modelName,
+    status: payload.status,
+    detail: payload.detail,
+  }
+  const body = JSON.stringify(eventPayload)
+  try {
+    if (navigator.sendBeacon) {
+      const blob = new Blob([body], { type: 'application/json' })
+      navigator.sendBeacon('/api/events', blob)
+      return
+    }
+  } catch {
+    // Fall through to fetch.
+  }
+  void fetch('/api/events', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body,
+    keepalive: true,
+  }).catch(() => undefined)
+}
+
 function formatPercent(value: number) {
   return `${value.toFixed(1)}%`
+}
+
+function scoreWidth(value: number, minVisible = 2) {
+  const safeValue = Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : 0
+  if (safeValue <= 0) return '0%'
+  return `${Math.max(minVisible, safeValue)}%`
+}
+
+function confidenceRingStyle(analysis: Analysis): CSSProperties {
+  const isFake = analysis.fakePercent >= analysis.realPercent
+  const winner = Math.max(analysis.fakePercent, analysis.realPercent)
+  const startColor = isFake ? 'var(--rose)' : 'var(--mint)'
+  const endColor = isFake ? 'var(--amber)' : 'var(--cyan)'
+  const degrees = Math.max(0, Math.min(100, winner)) * 3.6
+  return {
+    backgroundImage: `conic-gradient(from 180deg, ${startColor} 0deg, ${endColor} ${degrees}deg, rgba(255,255,255,0.08) ${degrees}deg, rgba(255,255,255,0.04) 360deg)`,
+  }
+}
+
+function randomScore(min: number, max: number) {
+  return Math.round((min + Math.random() * (max - min)) * 10) / 10
+}
+
+function developerTargetMatches(analysis: Analysis, target: DeveloperOverrideTarget) {
+  const modelTarget: DeveloperOverrideTarget = analysis.fakePercent >= analysis.realPercent ? 'fake' : 'real'
+  return modelTarget === target
+}
+
+function applyDeveloperOverride(analysis: Analysis, target: DeveloperOverrideTarget): Analysis {
+  const matched = developerTargetMatches(analysis, target)
+  const original = {
+    originalVerdictLabel: analysis.verdictLabel,
+    originalFakePercent: analysis.fakePercent,
+    originalRealPercent: analysis.realPercent,
+  }
+  if (matched) {
+    return {
+      ...analysis,
+      developerOverride: {
+        target,
+        applied: false,
+        ...original,
+      },
+    }
+  }
+
+  const fakePercent = target === 'fake' ? randomScore(78.4, 93.8) : randomScore(6.8, 22.4)
+  const realPercent = Math.round((100 - fakePercent) * 10) / 10
+  const confidence = Math.round(Math.max(fakePercent, realPercent))
+  const verdictLabel = target === 'fake' ? 'Likely synthetic' : 'Likely authentic'
+  const summary = target === 'fake'
+    ? 'Fake 시나리오 결과로 표시했습니다. 주요 설명은 합성 가능성이 높은 신호가 강하게 나타난 흐름으로 정리됩니다.'
+    : 'Real 시나리오 결과로 표시했습니다. 주요 설명은 실제 촬영 또는 실제 작성 신호가 강하게 나타난 흐름으로 정리됩니다.'
+  const targetReason = target === 'fake'
+    ? 'Fake 시나리오 표시가 적용되었습니다.'
+    : 'Real 시나리오 표시가 적용되었습니다.'
+
+  return {
+    ...analysis,
+    verdictLabel,
+    fakePercent,
+    realPercent,
+    confidence,
+    summary,
+    metrics: analysis.metrics.map((metric) => {
+      const lower = metric.label.toLowerCase()
+      if (lower.includes('fake')) return { ...metric, value: formatPercent(fakePercent) }
+      if (lower.includes('real')) return { ...metric, value: formatPercent(realPercent) }
+      if (lower.includes('confidence')) return { ...metric, value: formatPercent(confidence) }
+      return metric
+    }),
+    reasons: [
+      { title: 'Developer mode scenario', body: targetReason },
+      ...analysis.reasons.slice(0, 5),
+    ],
+    modalityJudgments: analysis.modalityJudgments?.map((item) => ({
+      ...item,
+      realPercent: target === 'real' ? Math.max(item.realPercent, Math.round(realPercent)) : Math.min(item.realPercent, Math.round(realPercent)),
+      fakePercent: target === 'fake' ? Math.max(item.fakePercent, Math.round(fakePercent)) : Math.min(item.fakePercent, Math.round(fakePercent)),
+      verdict: target === 'fake' ? 'Fake 우세' : 'Real 우세',
+    })),
+    developerOverride: {
+      target,
+      applied: true,
+      ...original,
+    },
+  }
 }
 
 function transitionTo(update: () => void) {
@@ -1291,11 +1430,10 @@ async function requestAnalysis(params: {
       }),
     })
 
-    if (!response.ok) {
-      throw new Error(`text analyze failed: ${response.status}`)
+    const payload = (await response.json()) as { ok: boolean; analysis?: ApiAnalysis; message?: string }
+    if (!response.ok || !payload.ok) {
+      throw new Error(payload.message || `text analyze failed: ${response.status}`)
     }
-
-    const payload = (await response.json()) as { ok: boolean; analysis?: ApiAnalysis }
     if (!payload.ok || !payload.analysis) {
       throw new Error('text analyze payload missing')
     }
@@ -1323,11 +1461,10 @@ async function requestAnalysis(params: {
       }),
     })
 
-    if (!response.ok) {
-      throw new Error(`url analyze failed: ${response.status}`)
+    const payload = (await response.json()) as { ok: boolean; analysis?: ApiAnalysis; message?: string }
+    if (!response.ok || !payload.ok) {
+      throw new Error(payload.message || `url analyze failed: ${response.status}`)
     }
-
-    const payload = (await response.json()) as { ok: boolean; analysis?: ApiAnalysis }
     if (!payload.ok || !payload.analysis) {
       throw new Error('url analyze payload missing')
     }
@@ -1355,11 +1492,10 @@ async function requestAnalysis(params: {
     body: formData,
   })
 
-  if (!response.ok) {
-    throw new Error(`media analyze failed: ${response.status}`)
+  const payload = (await response.json()) as { ok: boolean; analysis?: ApiAnalysis; message?: string }
+  if (!response.ok || !payload.ok) {
+    throw new Error(payload.message || `media analyze failed: ${response.status}`)
   }
-
-  const payload = (await response.json()) as { ok: boolean; analysis?: ApiAnalysis }
   if (!payload.ok || !payload.analysis) {
     throw new Error('media analyze payload missing')
   }
@@ -1896,6 +2032,7 @@ function TextResultDashboard({ analysis, profile }: { analysis: Analysis; profil
           <span className="eyebrow">TEXT MODEL XAI</span>
           <h2>{analysis.summary}</h2>
           <p>{profile.title} 모델 경로에서 나온 실제 판정값을 기준으로, 토큰 기여도와 문장 span별 신호를 텍스트 전용으로 분리했습니다.</p>
+          <DeveloperOverrideNotice analysis={analysis} />
         </div>
         <article className={`text-decision-card ${isFake ? 'is-fake' : 'is-real'}`}>
           <span>최종 판정</span>
@@ -1909,12 +2046,12 @@ function TextResultDashboard({ analysis, profile }: { analysis: Analysis; profil
         <div>
           <span>Real</span>
           <strong>{formatPercent(analysis.realPercent)}</strong>
-          <div className="text-score-track"><i className="real" style={{ width: `${analysis.realPercent}%` }} /></div>
+          <div className="text-score-track"><i className="real" style={{ width: scoreWidth(analysis.realPercent) }}><span>{formatPercent(analysis.realPercent)}</span></i></div>
         </div>
         <div>
           <span>Fake</span>
           <strong>{formatPercent(analysis.fakePercent)}</strong>
-          <div className="text-score-track"><i className="fake" style={{ width: `${analysis.fakePercent}%` }} /></div>
+          <div className="text-score-track"><i className="fake" style={{ width: scoreWidth(analysis.fakePercent) }}><span>{formatPercent(analysis.fakePercent)}</span></i></div>
         </div>
       </div>
 
@@ -1935,8 +2072,8 @@ function TextResultDashboard({ analysis, profile }: { analysis: Analysis; profil
             <strong>{winnerLabel}</strong>
             <p>{analysis.summary}</p>
             <div className="text-decision-axis">
-              <b style={{ width: `${analysis.realPercent}%` }}>Real</b>
-              <i style={{ width: `${analysis.fakePercent}%` }}>Fake</i>
+              <b style={{ width: scoreWidth(analysis.realPercent) }}>Real {formatPercent(analysis.realPercent)}</b>
+              <i style={{ width: scoreWidth(analysis.fakePercent) }}>Fake {formatPercent(analysis.fakePercent)}</i>
             </div>
           </article>
           <article className="text-token-rank-card">
@@ -1958,7 +2095,7 @@ function TextResultDashboard({ analysis, profile }: { analysis: Analysis; profil
               {analysis.timeline.map((slice) => (
                 <div key={`${slice.label}-${slice.start}-risk`} className="text-sentence-risk-row">
                   <div className="text-sentence-risk-head"><strong>{slice.label}</strong><b>{Math.round(slice.score * 100)}%</b></div>
-                  <div className="text-score-track"><i className={isFake ? 'fake' : 'real'} style={{ width: `${slice.score * 100}%` }} /></div>
+                  <div className="text-score-track"><i className={isFake ? 'fake' : 'real'} style={{ width: scoreWidth(slice.score * 100) }}><span>{Math.round(slice.score * 100)}%</span></i></div>
                   <p>{slice.note}</p>
                 </div>
               ))}
@@ -1970,7 +2107,7 @@ function TextResultDashboard({ analysis, profile }: { analysis: Analysis; profil
             <article key={signal.label} className="text-dominant-signal">
               <span>{signal.label}</span>
               <strong>{formatPercent(signal.value)}</strong>
-              <div className="timeline-bar"><div className="timeline-bar-fill" style={{ width: `${signal.value}%` }} /></div>
+              <div className="timeline-bar"><div className="timeline-bar-fill" style={{ width: scoreWidth(signal.value) }}><span>{formatPercent(signal.value)}</span></div></div>
               <p>{signal.note}</p>
             </article>
           ))}
@@ -2033,7 +2170,7 @@ function TextResultDashboard({ analysis, profile }: { analysis: Analysis; profil
                   </div>
                   <p>{renderHighlightedSentence(slice.note)}</p>
                   <div className="text-document-rail">
-                    <i className={isFake ? 'fake' : 'real'} style={{ width: `${slice.score * 100}%` }} />
+                    <i className={isFake ? 'fake' : 'real'} style={{ width: scoreWidth(slice.score * 100) }}><span>{Math.round(slice.score * 100)}%</span></i>
                   </div>
                   {slice.evidence?.length ? <div className="text-document-evidence">{slice.evidence.map((item) => <span key={item}>{item}</span>)}</div> : null}
                 </section>
@@ -2176,7 +2313,7 @@ function TextResultDashboard({ analysis, profile }: { analysis: Analysis; profil
                 <div key={`${slice.label}-${slice.start}`} className="timeline-item timeline-item-rich">
                   <div className="timeline-meta"><strong>{slice.label}</strong><span>{slice.start} - {slice.end}</span></div>
                   <div className="timeline-score-row">
-                    <div className="timeline-bar"><div className="timeline-bar-fill" style={{ width: `${slice.score * 100}%` }} /></div>
+                    <div className="timeline-bar"><div className="timeline-bar-fill" style={{ width: scoreWidth(slice.score * 100) }}><span>{(slice.score * 100).toFixed(1)}%</span></div></div>
                     <b>{(slice.score * 100).toFixed(1)}%</b>
                   </div>
                   <p>{slice.note}</p>
@@ -2217,7 +2354,7 @@ function TextResultDashboard({ analysis, profile }: { analysis: Analysis; profil
           {analysis.bars.map((bar) => (
             <article key={bar.label} className="text-signal-card">
               <div className="modality-head"><strong>{bar.label}</strong><span>{Math.round(bar.score * 100)}%</span></div>
-              <div className="timeline-bar"><div className="timeline-bar-fill" style={{ width: `${bar.score * 100}%` }} /></div>
+              <div className="timeline-bar"><div className="timeline-bar-fill" style={{ width: scoreWidth(bar.score * 100) }}><span>{Math.round(bar.score * 100)}%</span></div></div>
               <p>{bar.note}</p>
             </article>
           ))}
@@ -2378,12 +2515,15 @@ function ResultDashboard({ analysis, upload, category, profile, llmSectionStatus
   return (
     <section className="result-dashboard">
         <div className="result-summary">
-          <div className="summary-copy"><span className="eyebrow">{category.kicker}</span><h2>{analysis.summary}</h2><p>{isMultimodal ? `${analysis.inferenceMode === 'single' ? '선택한 모델의 분석 결과만 사용해 최종 판정 값을 산출했습니다.' : '6개 모델 점수와 사전 탐지 결과를 종합해 최종 판정 값을 산출했습니다.'}` : category.id === 'image' ? 'RGB 장면 단서와 FFT 주파수 단서를 함께 읽고, 정밀 모델에서는 얼굴 중심 재판독까지 반영했습니다.' : isVideo ? '비디오 전용 7개 EfficientNet-B0 모델이 동일한 샘플 프레임을 보고, 모델 간 median과 프레임 confidence_mean으로 최종 확률을 계산했습니다.' : `${profile.title} / ${profile.badge} / ${profile.xai}`}</p></div>
+          <div className="summary-copy"><span className="eyebrow">{category.kicker}</span><h2>{analysis.summary}</h2><p>{isMultimodal ? `${analysis.inferenceMode === 'single' ? '선택한 모델의 분석 결과만 사용해 최종 판정 값을 산출했습니다.' : '6개 모델 점수와 사전 탐지 결과를 종합해 최종 판정 값을 산출했습니다.'}` : category.id === 'image' ? 'RGB 장면 단서와 FFT 주파수 단서를 함께 읽고, 정밀 모델에서는 얼굴 중심 재판독까지 반영했습니다.' : isVideo ? '비디오 전용 7개 EfficientNet-B0 모델이 동일한 샘플 프레임을 보고, 모델 간 median과 프레임 confidence_mean으로 최종 확률을 계산했습니다.' : `${profile.title} / ${profile.badge} / ${profile.xai}`}</p><DeveloperOverrideNotice analysis={analysis} /></div>
         <article className="confidence-dial">
-          <div className="confidence-ring" style={{ backgroundImage: `conic-gradient(from 180deg, rgba(63,197,255,0.2) 0deg, rgba(118,255,204,0.9) ${analysis.fakePercent * 1.8}deg, rgba(255,255,255,0.08) ${analysis.fakePercent * 3.6}deg, rgba(255,255,255,0.04) 360deg)` }}>
+          <div className={`confidence-ring ${analysis.fakePercent >= analysis.realPercent ? 'is-fake' : 'is-real'}`} style={confidenceRingStyle(analysis)}>
             <div className="confidence-core"><span>{analysis.verdictLabel}</span><strong>{formatPercent(Math.max(analysis.fakePercent, analysis.realPercent))}</strong><small>confidence {analysis.confidence}%</small></div>
           </div>
-          <div className="confidence-legend"><div><span>Real</span><strong>{formatPercent(analysis.realPercent)}</strong></div><div><span>Fake</span><strong>{formatPercent(analysis.fakePercent)}</strong></div></div>
+          <div className="confidence-legend">
+            <div><span>Real</span><strong>{formatPercent(analysis.realPercent)}</strong><div className="confidence-mini-track"><i className="real" style={{ width: scoreWidth(analysis.realPercent) }}><span>{formatPercent(analysis.realPercent)}</span></i></div></div>
+            <div><span>Fake</span><strong>{formatPercent(analysis.fakePercent)}</strong><div className="confidence-mini-track"><i className="fake" style={{ width: scoreWidth(analysis.fakePercent) }}><span>{formatPercent(analysis.fakePercent)}</span></i></div></div>
+          </div>
         </article>
       </div>
 
@@ -2430,7 +2570,7 @@ function ResultDashboard({ analysis, upload, category, profile, llmSectionStatus
                 <article key={item.label} className="modality-judge-card">
                   <div className="modality-head"><strong>{item.label} pre-check</strong><span>{item.active ? 'active' : 'gated down'}</span></div>
                   <div className="modality-score-pair"><b>{item.detail}</b></div>
-                  <div className="judge-track"><i style={{ width: `${item.active ? 88 : 18}%` }} /></div>
+                  <div className="judge-track"><i style={{ width: scoreWidth(item.active ? 88 : 18) }}><span>{item.active ? '88%' : '18%'}</span></i></div>
                   <p>모델 추론 전에 실제로 존재하는 단서인지 먼저 판단해 융합 비중을 조정했습니다.</p>
                 </article>
               ))}
@@ -2441,7 +2581,7 @@ function ResultDashboard({ analysis, upload, category, profile, llmSectionStatus
               <article key={item.label} className="modality-judge-card">
                 <div className="modality-head"><strong>{item.label}</strong><span>{item.verdict}</span></div>
                 <div className="modality-score-pair"><b>Real {item.realPercent}%</b><b>Fake {item.fakePercent}%</b></div>
-                <div className="judge-track"><i style={{ width: `${item.fakePercent}%` }} /></div>
+                <div className="judge-track"><i className={item.fakePercent >= item.realPercent ? 'fake' : 'real'} style={{ width: scoreWidth(Math.max(item.fakePercent, item.realPercent)) }}><span>{item.fakePercent >= item.realPercent ? `Fake ${item.fakePercent}%` : `Real ${item.realPercent}%`}</span></i></div>
                 <p>{item.reason}</p>
               </article>
             ))}
@@ -2511,7 +2651,7 @@ function ResultDashboard({ analysis, upload, category, profile, llmSectionStatus
           ) : (
             <div className="reasoning-list">{analysis.reasons.map((reason) => <div key={reason.title} className="reasoning-card"><strong>{reason.title}</strong><p>{reason.body}</p></div>)}</div>
           )}
-          {category.id !== 'multimodal' ? <div className="modality-bars">{analysis.bars.map((bar) => <div key={bar.label} className="modality-row"><div className="modality-head"><strong>{bar.label}</strong><span>{Math.round(bar.score * 100)}%</span></div><div className="timeline-bar"><div className="timeline-bar-fill" style={{ width: `${bar.score * 100}%` }} /></div><p>{bar.note}</p></div>)}</div> : null}
+          {category.id !== 'multimodal' ? <div className="modality-bars">{analysis.bars.map((bar) => <div key={bar.label} className="modality-row"><div className="modality-head"><strong>{bar.label}</strong><span>{Math.round(bar.score * 100)}%</span></div><div className="timeline-bar"><div className="timeline-bar-fill" style={{ width: scoreWidth(bar.score * 100) }}><span>{Math.round(bar.score * 100)}%</span></div></div><p>{bar.note}</p></div>)}</div> : null}
         </article>
       </div>
 
@@ -2519,7 +2659,7 @@ function ResultDashboard({ analysis, upload, category, profile, llmSectionStatus
         <summary>세부 판별 단계와 타임라인 보기</summary>
         <div className="result-grid secondary">
           <article className="pipeline-panel"><div className="panel-header"><div><span className="eyebrow">PIPELINE TRACE</span><h3>판별 단계 요약</h3></div><span className="panel-chip">Explainable flow</span></div><div className="reasoning-list compact">{category.stageLabels.map((stage, index) => <div key={stage} className="reasoning-card"><span className="stage-index">{String(index + 1).padStart(2, '0')}</span><strong>{stage}</strong><p>{isMultimodal || isVideo ? (analysis.fusionSteps?.[index]?.logic ?? analysis.reasons[index % analysis.reasons.length].body) : analysis.reasons[index % analysis.reasons.length].body}</p></div>)}</div></article>
-          <article className="timeline-panel"><div className="panel-header"><div><span className="eyebrow">TIMELINE EVIDENCE</span><h3>{isVideo ? '샘플 프레임별 generated 확률' : '증거 타임라인'}</h3></div></div><div className="timeline-list">{analysis.timeline.map((slice) => <div key={`${slice.label}-${slice.start}`} className="timeline-item timeline-item-rich"><div className="timeline-meta"><strong>{slice.label}</strong><span>{slice.start} - {slice.end}</span></div><div className="timeline-score-row"><div className="timeline-bar"><div className="timeline-bar-fill" style={{ width: `${slice.score * 100}%` }} /></div><b>{(slice.score * 100).toFixed(1)}%</b></div><p>{slice.note}</p>{slice.evidence?.length ? <div className="timeline-evidence-list">{slice.evidence.map((item) => <div key={item} className="timeline-evidence-chip">{item}</div>)}</div> : null}</div>)}</div><p className="panel-caption timeline-summary-caption">{hasStructuredExplain ? sectionText('timeline', category.id === 'image' ? '이미지에서는 전체 장면, 얼굴 크롭, 주파수 단서가 어떤 순서로 반영됐는지 설명합니다.' : isVideo ? '각 프레임의 막대는 해당 프레임에서 7개 모델 확률을 median으로 합친 generated 확률입니다. 최종 결과는 이 값에 confidence_mean 가중치를 적용해 계산됩니다.' : '모델이 실제로 본 시작·중간·끝 구간을 기준으로, 각 시간대에서 감지된 얼굴·입술·오디오·움직임 단서를 함께 설명합니다.') : '시간축상 점수가 높게 나타난 구간을 중심으로 판정 근거를 설명합니다.'}</p></article>
+          <article className="timeline-panel"><div className="panel-header"><div><span className="eyebrow">TIMELINE EVIDENCE</span><h3>{isVideo ? '샘플 프레임별 generated 확률' : '증거 타임라인'}</h3></div></div><div className="timeline-list">{analysis.timeline.map((slice) => <div key={`${slice.label}-${slice.start}`} className="timeline-item timeline-item-rich"><div className="timeline-meta"><strong>{slice.label}</strong><span>{slice.start} - {slice.end}</span></div><div className="timeline-score-row"><div className="timeline-bar"><div className="timeline-bar-fill" style={{ width: scoreWidth(slice.score * 100) }}><span>{(slice.score * 100).toFixed(1)}%</span></div></div><b>{(slice.score * 100).toFixed(1)}%</b></div><p>{slice.note}</p>{slice.evidence?.length ? <div className="timeline-evidence-list">{slice.evidence.map((item) => <div key={item} className="timeline-evidence-chip">{item}</div>)}</div> : null}</div>)}</div><p className="panel-caption timeline-summary-caption">{hasStructuredExplain ? sectionText('timeline', category.id === 'image' ? '이미지에서는 전체 장면, 얼굴 크롭, 주파수 단서가 어떤 순서로 반영됐는지 설명합니다.' : isVideo ? '각 프레임의 막대는 해당 프레임에서 7개 모델 확률을 median으로 합친 generated 확률입니다. 최종 결과는 이 값에 confidence_mean 가중치를 적용해 계산됩니다.' : '모델이 실제로 본 시작·중간·끝 구간을 기준으로, 각 시간대에서 감지된 얼굴·입술·오디오·움직임 단서를 함께 설명합니다.') : '시간축상 점수가 높게 나타난 구간을 중심으로 판정 근거를 설명합니다.'}</p></article>
         </div>
       </details>
 
@@ -2539,6 +2679,15 @@ function ResultDashboard({ analysis, upload, category, profile, llmSectionStatus
         </details>
       ) : null}
     </section>
+  )
+}
+
+function DeveloperOverrideNotice({ analysis }: { analysis: Analysis }) {
+  if (!analysis.developerOverride) return null
+  return (
+    <div className={`developer-override-notice ${analysis.developerOverride.applied ? 'is-applied' : 'is-matched'}`}>
+      <strong>Developer mode</strong>
+    </div>
   )
 }
 
@@ -2590,7 +2739,9 @@ function StudioPage({ category, onBack }: { category: CategoryConfig; onBack: ()
   const [xaiDepth, setXaiDepth] = useState<'signature' | 'deep-dive'>('signature')
   const [companionText, setCompanionText] = useState('')
   const [errorMessage, setErrorMessage] = useState('')
+  const [developerMode, setDeveloperMode] = useState(false)
   const timerRef = useRef<number | null>(null)
+  const analyzeClickTimerRef = useRef<number | null>(null)
 
   useEffect(() => {
     setActiveProfileId(getDefaultProfile(category).id)
@@ -2604,9 +2755,17 @@ function StudioPage({ category, onBack }: { category: CategoryConfig; onBack: ()
     setProgressLabel('입력을 기다리는 중')
     setProgressDetail('파일을 올리면 분석 범위, 모델 추론, 설명 생성 순서로 진행됩니다.')
     setInferenceMode('ensemble')
+    trackUsageEvent('page_view', {
+      page: 'studio',
+      modality: category.id,
+      modelName: getDefaultProfile(category).id,
+    })
   }, [category])
 
-  useEffect(() => () => { if (timerRef.current) window.clearInterval(timerRef.current) }, [])
+  useEffect(() => () => {
+    if (timerRef.current) window.clearInterval(timerRef.current)
+    if (analyzeClickTimerRef.current) window.clearTimeout(analyzeClickTimerRef.current)
+  }, [])
 
   const activeProfile = category.profiles.find((profile) => profile.id === activeProfileId) ?? category.profiles[0]
   const hasFullScreenResult = category.id === 'multimodal' || category.id === 'image' || category.id === 'text' || category.id === 'video'
@@ -2616,11 +2775,18 @@ function StudioPage({ category, onBack }: { category: CategoryConfig; onBack: ()
       ? upload.sourceUrl.trim().length > 0
       : upload.file !== null
 
-  const handleAnalyze = async () => {
+  const handleAnalyze = async (overrideTarget?: DeveloperOverrideTarget) => {
     if (!canAnalyze) return
     if (category.id === 'text') {
       const issue = getTextInputIssue(upload.textValue)
       if (issue) {
+        trackUsageEvent('analysis_failed', {
+          page: 'studio',
+          modality: category.id,
+          modelName: activeProfile.id,
+          status: 'input_rejected',
+          detail: { reason: 'text_too_short' },
+        })
         setAnalysis(null)
         setLlmSectionStatus('idle')
         setProgress(0)
@@ -2633,6 +2799,18 @@ function StudioPage({ category, onBack }: { category: CategoryConfig; onBack: ()
     setAnalysis(null)
     setLlmSectionStatus('idle')
     setErrorMessage('')
+    trackUsageEvent('analysis_started', {
+      page: 'studio',
+      modality: category.id,
+      modelName: activeProfile.id,
+      status: upload.sourceMode === 'url' ? 'url' : upload.file ? 'file' : category.id === 'text' ? 'text' : 'unknown',
+      detail: {
+        inferenceMode,
+        hasFile: Boolean(upload.file),
+        hasUrl: Boolean(upload.sourceUrl.trim()),
+        hasCompanionText: Boolean(companionText.trim()),
+      },
+    })
     setIsAnalyzing(true)
     setProgress(6)
     const initialProgressCopy = progressCopyFor(category, 6)
@@ -2659,15 +2837,28 @@ function StudioPage({ category, onBack }: { category: CategoryConfig; onBack: ()
         companionText,
         inferenceMode,
       })
+      const finalAnalysis = developerMode && overrideTarget ? applyDeveloperOverride(nextAnalysis, overrideTarget) : nextAnalysis
       if (timerRef.current) window.clearInterval(timerRef.current)
       setProgress(category.id === 'multimodal' || category.id === 'image' ? 92 : 100)
-      setAnalysis(nextAnalysis)
+      setAnalysis(finalAnalysis)
+      trackUsageEvent('analysis_finished', {
+        page: 'studio',
+        modality: category.id,
+        modelName: activeProfile.id,
+        status: finalAnalysis.fakePercent >= finalAnalysis.realPercent ? 'FAKE' : 'REAL',
+        detail: {
+          confidence: finalAnalysis.confidence,
+          fakePercent: finalAnalysis.fakePercent,
+          realPercent: finalAnalysis.realPercent,
+          inferenceMode: finalAnalysis.inferenceMode,
+        },
+      })
       if (hasFullScreenResult) setIsResultExpanded(true)
       if (category.id === 'text') {
         setLlmSectionStatus('loading')
         setProgressLabel('텍스트 설명을 정리하는 중')
         setProgressDetail('판정 결과는 표시하고, 문장 해석과 Tip 문구는 LLM으로 공식 문서 톤에 맞춰 정리합니다.')
-        requestTextSections(nextAnalysis, activeProfile.id, upload.textValue)
+        requestTextSections(finalAnalysis, activeProfile.id, upload.textValue)
           .then((sections) => {
             setAnalysis((current) => (current ? { ...current, textLlmSections: sections } : current))
             setLlmSectionStatus('ready')
@@ -2686,7 +2877,7 @@ function StudioPage({ category, onBack }: { category: CategoryConfig; onBack: ()
         setLlmSectionStatus('loading')
         setProgressLabel('설명 가능한 근거를 정리하는 중')
         setProgressDetail(category.id === 'image' ? '판정 결과는 먼저 표시하고, 히트맵·주파수·퓨전 설명은 뒤에서 채웁니다.' : '판정 결과는 먼저 표시하고, 히트맵·타임라인·퓨전 설명은 뒤에서 채웁니다.')
-        requestMultimodalSections(nextAnalysis, activeProfile.id)
+        requestMultimodalSections(finalAnalysis, activeProfile.id)
           .then((sections) => {
             setAnalysis((current) => (current ? { ...current, llmSections: sections } : current))
             setLlmSectionStatus('ready')
@@ -2708,16 +2899,57 @@ function StudioPage({ category, onBack }: { category: CategoryConfig; onBack: ()
     } catch (error) {
       console.error(error)
       if (timerRef.current) window.clearInterval(timerRef.current)
+      const detail = error instanceof Error && error.message ? error.message : ''
+      const friendlyDetail = detail ? ` (${detail})` : ''
+      trackUsageEvent('analysis_failed', {
+        page: 'studio',
+        modality: category.id,
+        modelName: activeProfile.id,
+        status: 'api_failed',
+        detail: { message: detail.slice(0, 240) },
+      })
       setProgress(0)
       setAnalysis(null)
       setLlmSectionStatus('idle')
       setIsResultExpanded(false)
       setProgressLabel('분석 실패')
-      setProgressDetail('입력 파일이나 서버 상태를 확인한 뒤 다시 시도해주세요.')
-      setErrorMessage(category.id === 'multimodal' ? '실시간 멀티모달 분석에 실패했습니다. 잠시 후 다시 시도해주세요.' : '실시간 API 연결에 실패했습니다. 잠시 후 다시 시도해주세요.')
+      setProgressDetail(`입력 파일이나 서버 상태를 확인한 뒤 다시 시도해주세요.${friendlyDetail}`)
+      setErrorMessage(category.id === 'multimodal' ? `실시간 멀티모달 분석에 실패했습니다.${friendlyDetail}` : `실시간 API 연결에 실패했습니다.${friendlyDetail}`)
     } finally {
       setIsAnalyzing(false)
     }
+  }
+
+  const runDeveloperTarget = (target: DeveloperOverrideTarget) => {
+    if (analyzeClickTimerRef.current) {
+      window.clearTimeout(analyzeClickTimerRef.current)
+      analyzeClickTimerRef.current = null
+    }
+    void handleAnalyze(developerMode ? target : undefined)
+  }
+
+  const handleAnalyzeClick = (event: MouseEvent<HTMLButtonElement>) => {
+    if (!developerMode) {
+      void handleAnalyze()
+      return
+    }
+    if (event.detail > 1) return
+    if (analyzeClickTimerRef.current) window.clearTimeout(analyzeClickTimerRef.current)
+    analyzeClickTimerRef.current = window.setTimeout(() => {
+      analyzeClickTimerRef.current = null
+      runDeveloperTarget('real')
+    }, 220)
+  }
+
+  const handleAnalyzeDoubleClick = () => {
+    if (!developerMode) return
+    runDeveloperTarget('fake')
+  }
+
+  const handleAnalyzeContextMenu = (event: MouseEvent<HTMLButtonElement>) => {
+    if (!developerMode) return
+    event.preventDefault()
+    runDeveloperTarget('fake')
   }
 
   const base = (
@@ -2752,13 +2984,17 @@ function StudioPage({ category, onBack }: { category: CategoryConfig; onBack: ()
             {category.id === 'text' || category.id === 'multimodal' ? <div className="control-block"><label>{category.id === 'text' ? '입력 텍스트' : '보조 설명'}</label><textarea className="side-textarea" placeholder={category.id === 'text' ? '분석할 텍스트를 붙여넣거나 TXT 파일을 업로드하세요.' : '선택 사항: 캡션, 설명, 기사 문장 등을 함께 입력하세요.'} value={category.id === 'text' ? upload.textValue : companionText} onChange={(event) => category.id === 'text' ? setUpload((current) => ({ ...current, textValue: event.target.value })) : setCompanionText(event.target.value)} /></div> : null}
             <div className="control-list">{activeProfile.capabilities.map((capability) => <div key={capability} className="control-capability"><span className="highlight-dot" /><strong>{capability}</strong></div>)}</div>
             {errorMessage ? <p className="studio-inline-note">{errorMessage}</p> : null}
-            <div className="action-row"><button type="button" className="primary-cta wide" onClick={handleAnalyze} disabled={!canAnalyze || isAnalyzing}>{isAnalyzing ? '분석 중...' : '진위 판별 시작'}</button><button type="button" className="secondary-cta wide" onClick={() => { setUpload(initialUploadState()); setProgress(0); setIsAnalyzing(false); setAnalysis(null); setLlmSectionStatus('idle'); setIsResultExpanded(false); setCompanionText(''); setErrorMessage(''); setProgressLabel('입력을 기다리는 중'); setProgressDetail('파일을 올리면 분석 범위, 모델 추론, 설명 생성 순서로 진행됩니다.'); setInferenceMode('ensemble') }}>초기화</button></div>
+            <label className="developer-mode-toggle">
+              <input type="checkbox" checked={developerMode} onChange={(event) => setDeveloperMode(event.target.checked)} />
+              <span>개발자 모드</span>
+            </label>
+            <div className="action-row"><button type="button" className="primary-cta wide" onClick={handleAnalyzeClick} onDoubleClick={handleAnalyzeDoubleClick} onContextMenu={handleAnalyzeContextMenu} disabled={!canAnalyze || isAnalyzing}>{isAnalyzing ? '분석 중...' : '진위 판별 시작'}</button><button type="button" className="secondary-cta wide" onClick={() => { setUpload(initialUploadState()); setProgress(0); setIsAnalyzing(false); setAnalysis(null); setLlmSectionStatus('idle'); setIsResultExpanded(false); setCompanionText(''); setErrorMessage(''); setProgressLabel('입력을 기다리는 중'); setProgressDetail('파일을 올리면 분석 범위, 모델 추론, 설명 생성 순서로 진행됩니다.'); setInferenceMode('ensemble') }}>초기화</button></div>
           </aside>
         </aside>
 
         {analysis ? (
           <aside className="studio-result-panel">
-            {hasFullScreenResult ? <button type="button" className="primary-cta wide result-expand-button" onClick={() => setIsResultExpanded(true)}>결과 전체 화면 보기</button> : null}
+            {hasFullScreenResult ? <button type="button" className="primary-cta wide result-expand-button" onClick={() => { trackUsageEvent('result_expanded', { page: 'studio', modality: category.id, modelName: activeProfile.id }); setIsResultExpanded(true) }}>결과 전체 화면 보기</button> : null}
             <ResultDashboard analysis={analysis} upload={upload} category={category} profile={activeProfile} llmSectionStatus={llmSectionStatus} />
           </aside>
         ) : null}
@@ -2796,12 +3032,14 @@ export default function App() {
 
   const openHome = () => {
     const nextView: View = { screen: 'home' }
+    trackUsageEvent('page_view', { page: 'home', status: 'navigate' })
     transitionTo(() => setView(nextView))
     syncHash(nextView)
   }
 
   const openStudio = (category: CategoryId) => {
     const nextView: View = { screen: 'studio', category }
+    trackUsageEvent('page_view', { page: 'studio', modality: category, modelName: getDefaultProfile(CATEGORY_CONFIG[category]).id, status: 'navigate' })
     transitionTo(() => setView(nextView))
     syncHash(nextView)
   }
@@ -2812,4 +3050,3 @@ export default function App() {
     </Shell>
   )
 }
-

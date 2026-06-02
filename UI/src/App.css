@@ -2216,16 +2216,34 @@ li,
 .timeline-bar {
   position: relative;
   overflow: hidden;
-  height: 12px;
+  height: 16px;
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.08);
 }
 
-.progress-fill,
 .timeline-bar-fill {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  height: 100%;
+  min-width: 0;
+  padding-right: 6px;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--cyan), var(--emerald));
+  color: rgba(5, 15, 22, 0.92);
+  font-size: 10px;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.progress-fill {
   height: 100%;
   border-radius: inherit;
   background: linear-gradient(90deg, var(--cyan), var(--emerald));
+}
+
+.timeline-bar-fill span {
+  line-height: 1;
 }
 
 .progress-glow {
@@ -2457,24 +2475,39 @@ li,
 }
 
 .text-score-track {
-  height: 12px;
+  height: 18px;
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.07);
   overflow: hidden;
 }
 
 .text-score-track i {
-  display: block;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
   height: 100%;
+  min-width: 0;
+  padding-right: 7px;
   border-radius: inherit;
+  color: rgba(5, 15, 22, 0.92);
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 900;
+  white-space: nowrap;
 }
 
-.text-score-track .real {
+.text-score-track .real,
+.text-score-track i.real {
   background: linear-gradient(90deg, var(--mint), var(--cyan));
 }
 
-.text-score-track .fake {
+.text-score-track .fake,
+.text-score-track i.fake {
   background: linear-gradient(90deg, var(--rose), var(--amber));
+}
+
+.text-score-track i span {
+  line-height: 1;
 }
 
 .text-why-board {
@@ -2555,9 +2588,10 @@ li,
   place-items: center;
   min-width: 52px;
   color: #050505;
-  font-size: 0.78rem;
+  font-size: 0.76rem;
   font-style: normal;
   font-weight: 900;
+  white-space: nowrap;
 }
 
 .text-decision-axis b {
@@ -2904,16 +2938,25 @@ li,
 }
 
 .text-document-rail {
-  height: 8px;
+  height: 16px;
   overflow: hidden;
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.08);
 }
 
 .text-document-rail i {
-  display: block;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
   height: 100%;
+  min-width: 0;
+  padding-right: 6px;
   border-radius: inherit;
+  color: rgba(5, 15, 22, 0.92);
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 900;
+  white-space: nowrap;
 }
 
 .text-document-rail .fake {
@@ -3386,17 +3429,34 @@ li,
 .judge-track {
   margin: 12px 0 14px;
   width: 100%;
-  height: 12px;
+  height: 16px;
   border-radius: 999px;
   overflow: hidden;
   background: rgba(255, 255, 255, 0.08);
 }
 
 .judge-track i {
-  display: block;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
   height: 100%;
+  min-width: 0;
+  padding-right: 6px;
   border-radius: inherit;
   background: linear-gradient(90deg, var(--amber), var(--rose));
+  color: rgba(5, 15, 22, 0.92);
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.judge-track i.real {
+  background: linear-gradient(90deg, var(--mint), var(--cyan));
+}
+
+.judge-track i.fake {
+  background: linear-gradient(90deg, var(--rose), var(--amber));
 }
 
 .visual-stage-compact {
@@ -3869,6 +3929,42 @@ li,
 
 .confidence-legend {
   width: 100%;
+}
+
+.confidence-legend > div {
+  min-width: 0;
+}
+
+.confidence-mini-track {
+  width: min(160px, 100%);
+  height: 16px;
+  margin-top: 7px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.confidence-mini-track i {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  height: 100%;
+  min-width: 2px;
+  padding-right: 6px;
+  border-radius: inherit;
+  color: rgba(5, 15, 22, 0.92);
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.confidence-mini-track i.real {
+  background: linear-gradient(90deg, var(--mint), var(--cyan));
+}
+
+.confidence-mini-track i.fake {
+  background: linear-gradient(90deg, var(--rose), var(--amber));
 }
 
 .visual-stage {
@@ -5460,4 +5556,66 @@ button:focus-visible {
 .segmented button.is-active,
 .upload-mode-switch button.is-active {
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--tone) 18%, transparent), inset 0 1px 0 rgba(255, 255, 255, 0.14);
+}
+
+.developer-mode-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: fit-content;
+  margin: 8px 0 10px;
+  padding: 7px 10px;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 8px;
+  color: rgba(226, 232, 240, 0.78);
+  font-size: 12px;
+  cursor: pointer;
+  user-select: none;
+  background: rgba(15, 23, 42, 0.42);
+}
+
+.developer-mode-toggle input {
+  width: 14px;
+  height: 14px;
+  accent-color: #38bdf8;
+}
+
+.developer-mode-toggle span {
+  font-weight: 700;
+}
+
+.developer-mode-toggle small {
+  color: rgba(148, 163, 184, 0.84);
+  white-space: nowrap;
+}
+
+.developer-override-notice {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  width: fit-content;
+  margin-top: 10px;
+  padding: 7px 10px;
+  border: 1px solid rgba(56, 189, 248, 0.32);
+  border-radius: 8px;
+  background: rgba(8, 47, 73, 0.22);
+  color: rgba(224, 242, 254, 0.94);
+  font-size: 12px;
+}
+
+.developer-override-notice strong {
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 11px;
+  color: #7dd3fc;
+}
+
+.developer-override-notice.is-applied {
+  border-color: rgba(248, 113, 113, 0.42);
+  background: rgba(69, 10, 10, 0.22);
+  color: #fecaca;
+}
+
+.developer-override-notice.is-applied strong {
+  color: #f87171;
 }

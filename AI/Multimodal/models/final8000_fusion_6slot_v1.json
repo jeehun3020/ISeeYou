@@ -1,0 +1,30 @@
+{
+  "name": "final8000_fusion_6slot_v1",
+  "source_experiment": "D:\\ISeeYou\\experiments\\final8000_fusion_6slot_v1",
+  "selected_model": "mean4_with_avsync",
+  "score_type": "calibrated_weighted_mean",
+  "threshold": 0.5125,
+  "calibrate_threshold_to_half": true,
+  "weights": {
+    "openclip": 0.25,
+    "flava": 0.25,
+    "frequency": 0.25,
+    "avsync": 0.25
+  },
+  "metrics": {
+    "val": {
+      "accuracy": 0.894375,
+      "f1": 0.8954854669140383,
+      "roc_auc": 0.9506796875
+    },
+    "test": {
+      "accuracy": 0.89125,
+      "f1": 0.8927250308261405,
+      "roc_auc": 0.9542421875
+    }
+  },
+  "notes": [
+    "Final8000 AVSync is partially resumed: existing final5000 rows were reused and new rows remain neutral-pending.",
+    "The runtime still computes live OpenCLIP/head/AVSync scores; this config changes the ensemble decision rule."
+  ]
+}

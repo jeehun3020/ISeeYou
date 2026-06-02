@@ -18,7 +18,7 @@ UI/
 ├── src/pages/         # 페이지 래퍼
 ├── src/assets/        # SVG 시각 자료
 ├── public/            # GLB 로고, favicon, XAI reference image
-├── vite.config.mjs    # /multimodal-api proxy 설정
+├── vite.config.mjs    # 사용자 분석 요청과 관리자 저장 게이트웨이 proxy 설정
 └── package.json
 ```
 
@@ -26,12 +26,14 @@ UI/
 ```powershell
 cd C:\Users\jjeong\Desktop\ISeeYou\UI
 npm install
-npm run dev -- --host 127.0.0.1 --port 5173
+npm run dev -- --host 127.0.0.1 --port 5174
 ```
 
 ## API 연결 위치
 - `src/App.tsx`의 `requestAnalysis`, `requestMultimodalSections`, `requestTextSections`에서 API를 호출합니다.
-- `vite.config.mjs`에서 `/multimodal-api`를 `http://127.0.0.1:8001`로 proxy합니다.
+- `vite.config.mjs`에서 분석 요청(`/multimodal-api/analyze...`)은 관리자 게이트웨이 `http://127.0.0.1:8787/api/analyze...`로 proxy합니다.
+- 관리자 게이트웨이는 요청 원본과 결과를 DB에 저장한 뒤 모델 서버 `http://127.0.0.1:8001`로 추론을 전달합니다.
+- XAI 설명 생성 요청(`/multimodal-api/explain...`)은 저장 대상이 아니므로 모델 서버 `http://127.0.0.1:8001`로 직접 proxy합니다.
 - `.env.local`은 민감정보 가능성 때문에 포함하지 않았습니다. 예시는 `.env.example`을 참고하세요.
 
 ## XAI 표시 방식

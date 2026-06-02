@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import traceback
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -56,6 +57,8 @@ RUNTIME_SOURCE_DIR = Path(r"D:\ISeeYou\experiments\final5000_gpu_anchor_fusion_v
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 AI_ROOT = PROJECT_ROOT / "AI"
 RUNTIME_CACHE_PATH = AI_ROOT / "Multimodal" / "models" / "_service_runtime_bundle_v4b.pt"
+FINAL8000_FUSION_CONFIG_PATH = AI_ROOT / "Multimodal" / "models" / "final8000_fusion_6slot_v1.json"
+OPENCLIP_WEIGHT_PATH = AI_ROOT / "Multimodal" / "models" / "open_clip" / "timm_vit_large_patch14_clip_224.openai" / "open_clip_pytorch_model.bin"
 TEXT_MODEL_BUNDLE_DIR = AI_ROOT / "Text" / "models" / "text_model_bundle"
 TEXT_MODEL_LOCK = threading.Lock()
 TEXT_MODEL_STATE: dict[str, Any] = {}
@@ -387,6 +390,114 @@ def download_remote_video(remote_url: str, download_dir: Path) -> Path:
     return mp4_files[0] if mp4_files else files[0]
 
 
+def is_youtube_url(remote_url: str) -> bool:
+    host = (urlparse(remote_url).netloc or "").lower()
+    return "youtube.com" in host or "youtu.be" in host
+
+
+def yt_dlp_browser_sources() -> list[str]:
+    configured = os.environ.get("ISY_YTDLP_BROWSER", "").strip()
+    if configured:
+        return [item.strip().lower() for item in configured.split(",") if item.strip()]
+    return ["chrome", "edge"]
+
+
+def find_downloaded_video(download_dir: Path) -> Path | None:
+    files = sorted(download_dir.glob("remote_video.*"))
+    if not files:
+        return None
+    mp4_files = [path for path in files if path.suffix.lower() == ".mp4"]
+    return mp4_files[0] if mp4_files else files[0]
+
+
+def readable_video_download_error(errors: list[str]) -> RuntimeError:
+    joined = " | ".join(item for item in errors if item).strip()
+    if (
+        "Sign in to confirm" in joined
+        or "not a bot" in joined
+        or "cookies-from-browser" in joined
+        or "Could not copy Chrome cookie database" in joined
+        or "Failed to decrypt with DPAPI" in joined
+    ):
+        return RuntimeError(
+            "YouTube가 자동 요청을 차단했거나 이 PC에서 브라우저 로그인 쿠키를 읽지 못했습니다. "
+            "Chrome/Edge를 완전히 종료해도 같은 문제가 나면 Windows DPAPI 복호화 제한 때문에 cookies-from-browser 방식이 막힌 상태일 수 있습니다. "
+            "이 경우 파일 업로드로 분석하거나, YouTube cookies.txt를 별도로 내보낸 뒤 ISY_YTDLP_COOKIES 환경변수로 연결해야 합니다. "
+            "서버는 쿠키 값을 화면이나 로그에 출력하지 않습니다."
+        )
+    return RuntimeError(f"원격 영상 다운로드에 실패했습니다: {joined or 'yt-dlp download failed'}")
+
+
+def download_remote_video(remote_url: str, download_dir: Path) -> Path:
+    output_template = str(download_dir / "remote_video.%(ext)s")
+    preferred_format = "best[ext=mp4][height<=720]/best[height<=720]/best"
+    errors: list[str] = []
+
+    if yt_dlp is not None:
+        base_options = {
+            "format": preferred_format,
+            "outtmpl": output_template,
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "restrictfilenames": True,
+        }
+        option_sets: list[tuple[str, dict[str, Any]]] = []
+        if is_youtube_url(remote_url):
+            cookie_file = os.environ.get("ISY_YTDLP_COOKIES", "").strip()
+            if cookie_file and Path(cookie_file).exists():
+                option_sets.append(("cookie-file", {**base_options, "cookiefile": cookie_file}))
+            for browser in yt_dlp_browser_sources():
+                option_sets.append((f"browser-cookies:{browser}", {**base_options, "cookiesfrombrowser": (browser,)}))
+        option_sets.append(("default", base_options))
+
+        for label, options in option_sets:
+            try:
+                with yt_dlp.YoutubeDL(options) as downloader:
+                    info = downloader.extract_info(remote_url, download=True)
+                    final_path = downloader.prepare_filename(info)
+                    merged_path = Path(final_path)
+                    if merged_path.suffix.lower() != ".mp4":
+                        candidate = merged_path.with_suffix(".mp4")
+                        if candidate.exists():
+                            merged_path = candidate
+                    if merged_path.exists():
+                        return merged_path
+                    found = find_downloaded_video(download_dir)
+                    if found is not None:
+                        return found
+            except Exception as error:  # noqa: BLE001
+                errors.append(f"{label}: {error}")
+
+    command = [
+        sys.executable,
+        "-m",
+        "yt_dlp",
+        "--no-playlist",
+        "-f",
+        preferred_format,
+        "-o",
+        output_template,
+        remote_url,
+    ]
+    if is_youtube_url(remote_url):
+        cookie_file = os.environ.get("ISY_YTDLP_COOKIES", "").strip()
+        if cookie_file and Path(cookie_file).exists():
+            command[3:3] = ["--cookies", cookie_file]
+        else:
+            command[3:3] = ["--cookies-from-browser", yt_dlp_browser_sources()[0]]
+    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    if completed.returncode != 0:
+        stderr = completed.stderr.strip() or completed.stdout.strip() or "yt-dlp download failed"
+        errors.append(f"cli: {stderr}")
+        raise readable_video_download_error(errors)
+    found = find_downloaded_video(download_dir)
+    if found is None:
+        errors.append("download completed but no output file was found")
+        raise readable_video_download_error(errors)
+    return found
+
+
 def clamp(value: float, minimum: float, maximum: float) -> float:
     return max(minimum, min(maximum, value))
 
@@ -492,7 +603,10 @@ def download_remote_image(remote_url: str, download_dir: Path) -> Path:
 
 def ensure_model() -> tuple[Any, Any, Any, str]:
     with MODEL_LOCK:
-        if MODEL_STATE:
+        clip_unavailable = MODEL_STATE.get("clip_unavailable")
+        if clip_unavailable:
+            raise RuntimeError(f"OpenCLIP runtime unavailable: {clip_unavailable}")
+        if "model" in MODEL_STATE:
             return (
                 MODEL_STATE["model"],
                 MODEL_STATE["preprocess"],
@@ -501,11 +615,16 @@ def ensure_model() -> tuple[Any, Any, Any, str]:
             )
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        model, _, preprocess = open_clip.create_model_and_transforms(
-            "ViT-L-14",
-            pretrained="openai",
-            device=device,
-        )
+        pretrained_source = str(OPENCLIP_WEIGHT_PATH) if OPENCLIP_WEIGHT_PATH.exists() else "openai"
+        try:
+            model, _, preprocess = open_clip.create_model_and_transforms(
+                "ViT-L-14",
+                pretrained=pretrained_source,
+                device=device,
+            )
+        except Exception as error:  # noqa: BLE001
+            MODEL_STATE["clip_unavailable"] = str(error)
+            raise
         tokenizer = open_clip.get_tokenizer("ViT-L-14")
         model.eval()
         MODEL_STATE.update(
@@ -1198,16 +1317,20 @@ def ensure_runtime_bundle() -> dict[str, Any]:
 
 
 def encode_image_prompts(image_rgb: np.ndarray, prompts: list[str]) -> np.ndarray:
-    model, preprocess, tokenizer, device = ensure_model()
-    image = preprocess(Image.fromarray(image_rgb)).unsqueeze(0).to(device)
-    with torch.no_grad():
-        tokens = tokenizer(prompts).to(device)
-        image_features = model.encode_image(image)
-        text_features = model.encode_text(tokens)
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-        logits = (100.0 * image_features @ text_features.T).softmax(dim=-1).squeeze(0).detach().cpu().numpy()
-    return logits.astype(np.float32)
+    try:
+        model, preprocess, tokenizer, device = ensure_model()
+        image = preprocess(Image.fromarray(image_rgb)).unsqueeze(0).to(device)
+        with torch.no_grad():
+            tokens = tokenizer(prompts).to(device)
+            image_features = model.encode_image(image)
+            text_features = model.encode_text(tokens)
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+            logits = (100.0 * image_features @ text_features.T).softmax(dim=-1).squeeze(0).detach().cpu().numpy()
+        return logits.astype(np.float32)
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+        return np.full(len(prompts), 1.0 / max(len(prompts), 1), dtype=np.float32)
 
 
 def json_response(handler: BaseHTTPRequestHandler, payload: dict[str, Any], status: int = 200) -> None:
@@ -1648,16 +1771,19 @@ def clip_real_fake(face_crop: np.ndarray, companion_text: str) -> tuple[float, f
 
     text_alignment = 0.5
     if companion_text.strip():
-        model, preprocess, tokenizer, device = ensure_model()
-        image = preprocess(Image.fromarray(face_crop)).unsqueeze(0).to(device)
-        with torch.no_grad():
-            image_features = model.encode_image(image)
-            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-            text_tokens = tokenizer([companion_text.strip()]).to(device)
-            text_embed = model.encode_text(text_tokens)
-            text_embed = text_embed / text_embed.norm(dim=-1, keepdim=True)
-            cosine = float((image_features * text_embed).sum().detach().cpu().item())
-        text_alignment = clamp((cosine + 1.0) / 2.0, 0.0, 1.0)
+        try:
+            model, preprocess, tokenizer, device = ensure_model()
+            image = preprocess(Image.fromarray(face_crop)).unsqueeze(0).to(device)
+            with torch.no_grad():
+                image_features = model.encode_image(image)
+                image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+                text_tokens = tokenizer([companion_text.strip()]).to(device)
+                text_embed = model.encode_text(text_tokens)
+                text_embed = text_embed / text_embed.norm(dim=-1, keepdim=True)
+                cosine = float((image_features * text_embed).sum().detach().cpu().item())
+            text_alignment = clamp((cosine + 1.0) / 2.0, 0.0, 1.0)
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
     return real_prob, fake_prob, text_alignment
 
 
@@ -2298,6 +2424,50 @@ def materialize_runtime_heads(
         anchors = enriched["prob_fake_openclip"].to_numpy(dtype=np.float32)
         enriched[f"prob_fake_{method_name}"] = np.clip(0.65 * raw_scores + 0.35 * anchors, 0.0, 1.0)
     return enriched
+
+
+
+def load_final8000_fusion_config() -> dict[str, Any] | None:
+    cached = MODEL_STATE.get("final8000_fusion_config")
+    if cached is not None:
+        return cached
+    if not FINAL8000_FUSION_CONFIG_PATH.exists():
+        MODEL_STATE["final8000_fusion_config"] = None
+        return None
+    try:
+        payload = json.loads(FINAL8000_FUSION_CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        MODEL_STATE["final8000_fusion_config"] = None
+        return None
+    MODEL_STATE["final8000_fusion_config"] = payload
+    return payload
+
+
+def compute_final8000_fusion_score(model_scores: dict[str, float]) -> tuple[float | None, dict[str, float]]:
+    config = load_final8000_fusion_config()
+    if not config:
+        return None, {}
+    weights = config.get("weights") or {}
+    numerator = 0.0
+    denominator = 0.0
+    used_weights: dict[str, float] = {}
+    for method_name, raw_weight in weights.items():
+        if method_name not in model_scores:
+            continue
+        weight = float(raw_weight)
+        score = float(model_scores[method_name])
+        numerator += score * weight
+        denominator += weight
+        used_weights[method_name] = weight
+    if denominator <= 0:
+        return None, {}
+    raw_score = numerator / denominator
+    threshold = float(config.get("threshold", 0.5))
+    if bool(config.get("calibrate_threshold_to_half", True)):
+        raw_score = raw_score - threshold + 0.5
+    total = sum(used_weights.values()) or 1.0
+    normalized = {name: value / total for name, value in used_weights.items()}
+    return clamp(raw_score, 0.0, 1.0), normalized
 
 
 def compute_runtime_weighted_model_score(
@@ -4085,7 +4255,6 @@ def analyze_multimodal(video_path: Path, selected_mode: str, companion_text: str
         runtime_frame = apply_gate_features(runtime_frame, runtime_bundle["runtime_stats"]["gate_thresholds"])
         weighted_model_score, adjusted_weights = compute_runtime_weighted_model_score(runtime_frame.iloc[0], runtime_bundle["base_weights"])
         runtime_frame["weighted_model_score"] = weighted_model_score
-        fusion_score = predict_runtime_fusion(runtime_bundle, runtime_frame)
 
         model_scores = {
             "openclip": float(runtime_frame["prob_fake_openclip"].iloc[0]),
@@ -4095,6 +4264,12 @@ def analyze_multimodal(video_path: Path, selected_mode: str, companion_text: str
             "frequency": float(runtime_frame["prob_fake_frequency"].iloc[0]),
             "scenegraph": float(runtime_frame["prob_fake_scenegraph"].iloc[0]),
         }
+        final8000_score, final8000_weights = compute_final8000_fusion_score(model_scores)
+        fusion_score = final8000_score if final8000_score is not None else predict_runtime_fusion(runtime_bundle, runtime_frame)
+        if final8000_weights:
+            adjusted_weights = final8000_weights
+            weighted_model_score = fusion_score
+            runtime_frame["weighted_model_score"] = weighted_model_score
         selected_key = MODE_TO_METHOD.get(selected_mode, "flava")
         selected_model_score = model_scores[selected_key]
         use_single_mode = inference_mode == "single"
@@ -4117,7 +4292,7 @@ def analyze_multimodal(video_path: Path, selected_mode: str, companion_text: str
             {"label": "AVSync", "score": round(model_scores["avsync"], 3), "note": f"립싱크 지연 {lag:+d} frames" if (availability["hasSpeech"] and availability["hasLips"]) else "음성 또는 입술 신호 gated"},
             {"label": "Frequency", "score": round(model_scores["frequency"], 3), "note": "10000개 실험 기반 주파수 점수"},
             {"label": "SceneGraph", "score": round(model_scores["scenegraph"], 3), "note": "10000개 실험 기반 구조 점수"},
-            {"label": "Fusion" if not use_single_mode else "Selected model", "score": round(float(fake_score), 3), "note": "pre-check + adaptive weighting + segment aggregation" if not use_single_mode else "선택 모델 1개만 사용한 단독 판정"},
+            {"label": "Fusion" if not use_single_mode else "Selected model", "score": round(float(fake_score), 3), "note": "final8000 mean4 fusion: OpenCLIP + FLAVA + Frequency + AVSync" if (not use_single_mode and final8000_weights) else "pre-check + adaptive weighting + segment aggregation" if not use_single_mode else "선택 모델 1개만 사용한 단독 판정"},
         ]
 
         regions = build_regions_from_heatmap(
@@ -4238,6 +4413,7 @@ class MultimodalHandler(BaseHTTPRequestHandler):
                 sections = call_openai_xai_sections(explanation_payload) or fallback_xai_sections(explanation_payload)
                 json_response(self, {"ok": True, "sections": sections})
             except Exception as error:  # noqa: BLE001
+                traceback.print_exc()
                 json_response(self, {"ok": False, "message": str(error)}, status=500)
             return
 
@@ -4260,6 +4436,7 @@ class MultimodalHandler(BaseHTTPRequestHandler):
                 sections = call_openai_text_xai_sections(explanation_payload) or fallback_text_xai_sections(explanation_payload)
                 json_response(self, {"ok": True, "sections": sections})
             except Exception as error:  # noqa: BLE001
+                traceback.print_exc()
                 json_response(self, {"ok": False, "message": str(error)}, status=500)
             return
 
@@ -4294,6 +4471,7 @@ class MultimodalHandler(BaseHTTPRequestHandler):
                     },
                 )
             except Exception as error:  # noqa: BLE001
+                traceback.print_exc()
                 json_response(self, {"ok": False, "message": str(error)}, status=500)
             return
 
@@ -4322,6 +4500,7 @@ class MultimodalHandler(BaseHTTPRequestHandler):
                     },
                 )
             except Exception as error:  # noqa: BLE001
+                traceback.print_exc()
                 json_response(self, {"ok": False, "message": str(error)}, status=500)
             finally:
                 if download_dir is not None:
@@ -4356,6 +4535,7 @@ class MultimodalHandler(BaseHTTPRequestHandler):
                     },
                 )
             except Exception as error:  # noqa: BLE001
+                traceback.print_exc()
                 json_response(self, {"ok": False, "message": str(error)}, status=500)
             finally:
                 if download_dir is not None:
@@ -4383,6 +4563,7 @@ class MultimodalHandler(BaseHTTPRequestHandler):
                     },
                 )
             except Exception as error:  # noqa: BLE001
+                traceback.print_exc()
                 json_response(self, {"ok": False, "message": str(error)}, status=500)
             finally:
                 if download_dir is not None:
@@ -4447,6 +4628,7 @@ class MultimodalHandler(BaseHTTPRequestHandler):
                 },
             )
         except Exception as error:  # noqa: BLE001
+            traceback.print_exc()
             json_response(self, {"ok": False, "message": str(error)}, status=500)
         finally:
             if upload_dir is not None:
