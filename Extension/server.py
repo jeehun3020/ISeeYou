@@ -1,21 +1,62 @@
 """
 ISY 실제 추론 서버
 엔드포인트:
-  POST /api/analyze/image  → 이미지 모델 (versionv9)
+  POST /api/analyze/image  → 이미지 모델 (versionv9 또는 versionv12)
   POST /api/analyze/text   → 텍스트 모델 (text_model/ 폴더 추가 시 활성화)
   POST /api/analyze/video  → 영상 모델 (video_model/ 폴더 추가 시 활성화)
 
-새 모델 추가 방법:
-  1. {type}_model/ 폴더를 versionv9와 동일한 구조로 생성
+이미지 모델 전환:
+  아래 IMAGE_MODEL_VERSION 한 줄만 "v3" / "v9" / "v12" 로 바꾸고 서버 재시작.
+  sys.path / import / 가중치 경로 / run_inference 분기 모두 자동 처리.
+
+새 이미지 모델 버전 추가:
+  1. versionvNN/ 폴더를 기존과 동일한 구조로 생성
      (model.py / config.py / preprocess.py / weights/best.pt)
-  2. 아래 _load_{type}_model() 함수 채우기
-  3. 서버 재시작
+  2. _IMAGE_MODEL_REGISTRY 에 한 줄 추가
+  3. run_inference 의 튜플 길이 분기 확인 (2개=v3형 / 3개=v9형 / 4개=v12형)
+
 실행: python server.py
 """
 
 import sys
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "versionv9"))
+
+# CLIP 가중치(open_clip)는 최초 1회 huggingface.co 에서 다운로드된다.
+# 백신/프록시의 TLS 검사 환경에서는 certifi 번들로 인증서 검증이 실패하므로,
+# 설치돼 있으면 Windows 인증서 저장소를 사용하도록 truststore 를 주입한다.
+# (인증서가 이미 정상이면 무해. 반드시 open_clip 을 import 하는 preprocess 보다 먼저 실행)
+try:
+    import truststore
+    truststore.inject_into_ssl()
+except Exception:
+    pass
+
+# ─── 이미지 모델 버전 선택 ─────────────────────────────────
+# "v9"  (LateFusion: RGB+FFT)
+# "v12" (TripleFusion: RGB+FFT+CLIP)
+# "v3"  (CLIP-only: CLIP ViT-L-14 임베딩 → Linear sigmoid, predict.py/tunmbs.pt 와 동일)
+IMAGE_MODEL_VERSION = "v3"
+# ───────────────────────────────────────────────────────────
+
+# force_cpu=True 인 버전은 CUDA가 있어도 이미지 모델을 CPU로 로드/추론한다.
+# v12(TripleFusion+CLIP)는 GPU VRAM을 초과(OOM)하므로 CPU로 강제.
+_IMAGE_MODEL_REGISTRY = {
+    "v9":  {"folder": "versionv9",  "label": "versionv9-fftB",          "force_cpu": False},
+    "v12": {"folder": "versionv12", "label": "versionv12-tripleFusion", "force_cpu": True},
+    "v3":  {"folder": "versionv3",  "label": "versionv3-clipViTL14",    "force_cpu": True},
+}
+_image_meta           = _IMAGE_MODEL_REGISTRY[IMAGE_MODEL_VERSION]
+_IMAGE_MODEL_FOLDER   = _image_meta["folder"]
+_IMAGE_MODEL_LABEL    = _image_meta["label"]
+_IMAGE_FORCE_CPU      = _image_meta.get("force_cpu", False)
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), _IMAGE_MODEL_FOLDER))
+
+# force_cpu 버전은 preprocess(CLIP/InsightFace)까지 CPU로 강제해야 OOM을 피한다.
+# preprocess.py 는 import 시점에 SIMCAP_DEVICE 환경변수를 읽어 CLIP/InsightFace 디바이스를
+# 결정하므로, 반드시 아래 import보다 먼저 설정해야 한다.
+if _IMAGE_FORCE_CPU:
+    os.environ["SIMCAP_DEVICE"] = "cpu"
 
 import hashlib
 import json
@@ -43,7 +84,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from model import load_model, LateFusionModel
+# 두 버전 모두 모듈 이름(model/preprocess/config)과 시그니처(load_model/preprocess_image)가 동일.
+# 클래스 이름만 다르므로(LateFusionModel ↔ TripleFusionModel) 클래스는 import하지 않는다.
+from model import load_model
 from preprocess import preprocess_image
 from config import MODEL_PATH
 from video_inference import (
@@ -55,14 +98,16 @@ from video_inference import (
 )
 
 # ── 모델 전역 상태 ──────────────────────────────────────────
-_image_model: Optional[LateFusionModel] = None
+# 이미지 모델은 버전에 따라 LateFusionModel 또는 TripleFusionModel — 공통 베이스 타입힌트는 생략
+_image_model = None
 _text_model = None
 _video_model = None
-_device: Optional[str] = None
+_device: Optional[str] = None          # 공통 디바이스 (영상/텍스트)
+_image_device: Optional[str] = None    # 이미지 모델 전용 — force_cpu면 "cpu"로 고정
 
 BASE_DIR      = os.path.dirname(__file__)
 BASE_PATH     = Path(BASE_DIR)
-IMAGE_WEIGHTS = os.path.join(BASE_DIR, "versionv9", MODEL_PATH)
+IMAGE_WEIGHTS = os.path.join(BASE_DIR, _IMAGE_MODEL_FOLDER, MODEL_PATH)
 TEXT_WEIGHTS  = os.path.join(BASE_DIR, "text_model", "weights", "best.pt")
 VIDEO_DIR     = os.path.join(BASE_DIR, "video")
 DEMO_PLATFORM_DIR = BASE_PATH / "demo_platform"
@@ -91,14 +136,16 @@ def _load_video_model(device: str):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _image_model, _text_model, _video_model, _device
+    global _image_model, _text_model, _video_model, _device, _image_device
     _device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"[ISY] 디바이스: {_device}")
+    # 이미지 모델은 force_cpu면 CUDA가 있어도 CPU 사용 (v12 OOM 회피)
+    _image_device = "cpu" if _IMAGE_FORCE_CPU else _device
+    print(f"[ISY] 디바이스: {_device} (이미지: {_image_device})")
 
     # 이미지 모델 (필수)
-    print(f"[ISY] 이미지 모델 로드 중: {IMAGE_WEIGHTS}")
-    _image_model = load_model(IMAGE_WEIGHTS, _device)
-    print("[ISY] 이미지 모델 준비됨")
+    print(f"[ISY] 이미지 모델 로드 중 ({IMAGE_MODEL_VERSION}, {_image_device}): {IMAGE_WEIGHTS}")
+    _image_model = load_model(IMAGE_WEIGHTS, _image_device)
+    print(f"[ISY] 이미지 모델 준비됨 ({_IMAGE_MODEL_LABEL})")
 
     # 텍스트 모델 (선택 — 폴더 있을 때만)
     if os.path.exists(TEXT_WEIGHTS):
@@ -127,7 +174,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://studio.youtube.com"],
     allow_origin_regex=r"chrome-extension://.*",
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["Content-Type"],
 )
 
@@ -217,8 +264,30 @@ def _put_platform_disclosure(video_id: str, disclosure: dict) -> None:
         _save_platform_disclosures(data)
 
 
+def _delete_platform_disclosure(video_id: str) -> bool:
+    """disclosure 메타 + 저장된 영상 파일을 함께 삭제한다.
+
+    메타가 없으면 False. 메타에 stored_filename이 있으면 uploads/의 파일도 제거하되,
+    파일이 이미 없어도(메타만 남은 경우) 메타 제거는 정상 처리한다.
+    """
+    with _platform_disclosure_lock:
+        data = _load_platform_disclosures()
+        disclosure = data.pop(video_id, None)
+        if disclosure is None:
+            return False
+        _save_platform_disclosures(data)
+
+    stored_filename = (disclosure or {}).get("stored_filename")
+    if stored_filename:
+        try:
+            (DEMO_UPLOAD_DIR / stored_filename).unlink(missing_ok=True)
+        except Exception:
+            traceback.print_exc()
+    return True
+
+
 def _result_level(fake_probability: float) -> str:
-    if fake_probability >= 0.6:
+    if fake_probability >= 0.7:
         return "high"
     if fake_probability >= 0.4:
         return "uncertain"
@@ -436,13 +505,24 @@ def fetch_image(url: str, page_url: Optional[str] = None) -> Image.Image:
 
 
 def run_inference(img_pil: Image.Image) -> dict:
-    assert _image_model is not None and _device is not None, "이미지 모델이 로드되지 않았습니다"
-    x_rgb, x_fft, crop_status = preprocess_image(img_pil)
-    x_rgb = x_rgb.to(_device)
-    x_fft = x_fft.to(_device)
+    assert _image_model is not None and _image_device is not None, "이미지 모델이 로드되지 않았습니다"
+
+    # v3:  (x_clip, crop_status) 2개 — 단일 입력(CLIP 임베딩) 모델
+    # v9:  (x_rgb, x_fft, crop_status) 3개
+    # v12: (x_rgb, x_fft, x_clip, crop_status) 4개
+    out = preprocess_image(img_pil)
+    if len(out) == 2:
+        x_single, crop_status = out
+        model_inputs = (x_single.to(_image_device),)
+    elif len(out) == 3:
+        x_rgb, x_fft, crop_status = out
+        model_inputs = (x_rgb.to(_image_device), x_fft.to(_image_device))
+    else:
+        x_rgb, x_fft, x_clip, crop_status = out
+        model_inputs = (x_rgb.to(_image_device), x_fft.to(_image_device), x_clip.to(_image_device))
 
     with torch.no_grad():
-        logits = _image_model(x_rgb, x_fft)
+        logits = _image_model(*model_inputs)
         probs = F.softmax(logits, dim=1)[0]
 
     fake_prob = probs[0].item()
@@ -454,7 +534,7 @@ def run_inference(img_pil: Image.Image) -> dict:
         "label": "REAL" if real_prob >= 0.5 else "FAKE",
         "consistency_score": round(real_prob * 100),
         "crop_status": crop_status,
-        "model": "versionv9-fftB",
+        "model": _IMAGE_MODEL_LABEL,
     }
 
 
@@ -665,6 +745,14 @@ def get_platform_disclosure(video_id: str):
     if not disclosure:
         raise HTTPException(status_code=404, detail="platform disclosure not found")
     return disclosure
+
+
+@app.delete("/api/platform/disclosures/{video_id}")
+def delete_platform_disclosure(video_id: str):
+    deleted = _delete_platform_disclosure(video_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="platform disclosure not found")
+    return {"ok": True, "video_id": video_id}
 
 
 @app.get("/api/platform/videos/{video_id}")

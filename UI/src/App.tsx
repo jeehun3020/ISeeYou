@@ -91,6 +91,7 @@ type Analysis = {
   heatmapPoints?: { x: number; y: number; radius: number; intensity: number; label: string }[]
   focusFrameUrl?: string
   mouthPreviewUrl?: string
+  detectionOverlays?: { label: string; timestamp: number; timeLabel: string; boxes: { kind: string; label: string; x: number; y: number; width: number; height: number; confidence?: number }[]; motionScore?: number }[]
   frequencyComparison?: { realReference: number[]; fakeReference: number[]; sample: number[]; note: string; sampleImage?: string }
   gatedBranches?: string[]
   llmSections?: { heatmap: string; timeline: string; fusion: string; frequency: string }
@@ -136,6 +137,7 @@ type ApiAnalysis = {
     modalityBars: { label: string; score: number; note: string }[]
     focusFrame?: string
     mouthPreview?: string
+    detectionOverlays?: { label: string; timestamp: number; timeLabel: string; boxes: { kind: string; label: string; x: number; y: number; width: number; height: number; confidence?: number }[]; motionScore?: number }[]
   }
 }
 
@@ -154,6 +156,7 @@ type VideoXai = {
   topFrameLabel: string
   consensus: string
   interpretation: string
+  originalFocusFrame?: string
   maskedFocusFrame?: string
 }
 
@@ -178,7 +181,7 @@ const CATEGORY_CONFIG: Record<CategoryId, CategoryConfig> = {
     inputHint: 'PNG, JPG, WEBP 이미지를 드래그하거나 선택하세요.',
     stageLabels: ['Decode', 'Vision pass', 'Forensic pass', 'Explain'],
     visual: sensorPortrait,
-    connectedModalities: ['Image/RGB', 'Face crop', 'FFT frequency'],
+    connectedModalities: ['Image/RGB', 'Face cues', 'FFT frequency'],
     profiles: [
       {
         id: 'image-fast',
@@ -284,9 +287,9 @@ const CATEGORY_CONFIG: Record<CategoryId, CategoryConfig> = {
     connectedModalities: ['Vision', 'Audio', 'Text when provided', 'Temporal', 'Frequency', 'Structure'],
     profiles: [
       { id: 'mm-openclip', title: 'OpenCLIP', subtitle: 'image-text consistency', description: '프레임과 텍스트 설명이 서로 맞는지 확인합니다.', accent: 'cyan', badge: 'Contrastive', latency: 'Balanced', xai: '장면-문장 정합성', capabilities: ['의미 정합성', '프레임 요약', '문맥 점수'] },
-      { id: 'mm-flava', title: 'FLAVA', subtitle: 'cross-modal fusion', description: '여러 입력 신호를 함께 묶어 최종 정합성을 계산합니다.', accent: 'violet', badge: 'Recommended', latency: 'Recommended', xai: '융합 근거 지도', recommended: true, capabilities: ['종합 점수', '신호 통합', '안정적 판정'] },
+      { id: 'mm-flava', title: 'FLAVA', subtitle: 'cross-modal fusion', description: '여러 입력 신호를 함께 묶어 최종 정합성을 계산합니다.', accent: 'violet', badge: 'Cross-modal', latency: 'Balanced', xai: '융합 근거 지도', capabilities: ['종합 점수', '신호 통합', '안정적 판정'] },
       { id: 'mm-blip-nli', title: 'BLIP + NLI', subtitle: 'caption contradiction', description: '장면 설명을 만들고 문장 간 모순 여부를 비교합니다.', accent: 'rose', badge: 'Explanation-led', latency: 'Narrative', xai: '설명 모순 카드', capabilities: ['장면 설명', '모순 확인', '텍스트 근거'] },
-      { id: 'mm-avsync', title: 'AVSync', subtitle: 'lip-audio mismatch', description: '입 모양과 음성 타이밍이 자연스럽게 맞는지 추적합니다.', accent: 'emerald', badge: 'Deepfake specialist', latency: 'Specialized', xai: '싱크 타임라인', capabilities: ['입 모양', '음성 지연', '시간축 이상'] },
+      { id: 'mm-avsync', title: 'AVSync', subtitle: 'lip-audio mismatch', description: '입 모양과 음성 타이밍이 자연스럽게 맞는지 추적합니다.', accent: 'emerald', badge: 'Recommended', latency: 'Specialized', xai: '싱크 타임라인', recommended: true, capabilities: ['입 모양', '음성 지연', '시간축 이상'] },
       { id: 'mm-frequency', title: 'Frequency Fusion', subtitle: 'artifact domain', description: '주파수 영역의 잔여 패턴으로 생성 흔적을 확인합니다.', accent: 'amber', badge: 'Artifact specialist', latency: 'Forensic', xai: '주파수 비교', capabilities: ['FFT 단서', '오디오 스펙트럼', '잔여 패턴'] },
       { id: 'mm-scenegraph', title: 'SceneGraph GCN', subtitle: 'relational structure', description: '객체와 장면 관계가 자연스럽게 유지되는지 비교합니다.', accent: 'slate', badge: 'Structured XAI', latency: 'Structured', xai: '관계 구조 근거', capabilities: ['객체 관계', '구조 신뢰도', '관계 설명'] },
     ],
@@ -343,7 +346,7 @@ const MODE_GUIDES: Record<CategoryId, {
     whenToUse: '영상에 음성, 인물, 자막, 설명 텍스트가 함께 있을 때 가장 많은 단서를 비교할 수 있습니다.',
     evidence: ['Visual score', 'Audio/Sync score', 'Text consistency', 'Frequency signal', 'Final decision'],
     xaiGuide: '신뢰도가 낮은 입력은 자동으로 영향력이 낮아지고, 확보된 단서가 최종 판단에 더 크게 반영됩니다.',
-    caution: '단서가 없는 모달리티는 gate down될 수 있으며, 이는 오류가 아니라 과신을 줄이기 위한 처리입니다.',
+    caution: '단서가 충분하지 않은 입력은 최종 판단에서 낮은 비중으로 처리됩니다. 이는 오류가 아니라 근거가 약한 정보를 과신하지 않기 위한 처리입니다.',
   },
 }
 
@@ -962,6 +965,7 @@ function mapApiAnalysisToUi(analysis: ApiAnalysis): Analysis {
     })),
     focusFrameUrl: analysis.xai.focusFrame,
     mouthPreviewUrl: analysis.xai.mouthPreview,
+    detectionOverlays: analysis.xai.detectionOverlays ?? [],
   }
 }
 
@@ -1047,6 +1051,142 @@ function XaiVisualMedia({ analysis, upload }: { analysis: Analysis; upload: Uplo
   return <div className="visual-fallback">Preview not available</div>
 }
 
+function canRenderDirectVideoUrl(sourceUrl: string) {
+  return /\.(mp4|webm|mov|m4v)(\?|#|$)/i.test(sourceUrl.trim())
+}
+
+function extractYouTubeVideoId(sourceUrl: string): string {
+  const trimmed = sourceUrl.trim()
+  if (!trimmed) return ''
+  try {
+    const parsed = new URL(trimmed.startsWith('http') ? trimmed : `https://${trimmed}`)
+    const host = parsed.hostname.replace(/^www\./, '').toLowerCase()
+    if (host === 'youtu.be') return parsed.pathname.split('/').filter(Boolean)[0] ?? ''
+    if (!host.endsWith('youtube.com')) return ''
+    if (parsed.pathname === '/watch') return parsed.searchParams.get('v') ?? ''
+    const parts = parsed.pathname.split('/').filter(Boolean)
+    if (parts[0] === 'shorts' || parts[0] === 'embed' || parts[0] === 'live') return parts[1] ?? ''
+    return ''
+  } catch {
+    const match = trimmed.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|shorts\/|embed\/|live\/))([A-Za-z0-9_-]{6,})/)
+    return match?.[1] ?? ''
+  }
+}
+
+function SourceOverlayMedia({ analysis, upload }: { analysis: Analysis; upload: UploadState }) {
+  const uploadedVideoUrl = upload.previewUrl && upload.file?.type.startsWith('video/') ? upload.previewUrl : ''
+  const directVideoUrl = upload.sourceMode === 'url' && canRenderDirectVideoUrl(upload.sourceUrl) ? upload.sourceUrl : ''
+  const videoUrl = uploadedVideoUrl || directVideoUrl
+
+  if (videoUrl) {
+    return (
+      <video
+        src={videoUrl}
+        className="visual-media source-overlay-video"
+        controls
+        loop
+        autoPlay
+        playsInline
+      />
+    )
+  }
+
+  return <XaiVisualMedia analysis={analysis} upload={upload} />
+}
+
+function SourceOverlayStage({ analysis, upload, frameRows }: { analysis: Analysis; upload: UploadState; frameRows: { label: string; range: string; score: number; verdict: string; note: string }[] }) {
+  const [currentTime, setCurrentTime] = useState(0)
+  const uploadedVideoUrl = upload.previewUrl && upload.file?.type.startsWith('video/') ? upload.previewUrl : ''
+  const directVideoUrl = upload.sourceMode === 'url' && canRenderDirectVideoUrl(upload.sourceUrl) ? upload.sourceUrl : ''
+  const videoUrl = uploadedVideoUrl || directVideoUrl
+  const isRepresentativeImage = !videoUrl
+  const overlays = analysis.detectionOverlays ?? []
+  const activeOverlay = overlays.length
+    ? (isRepresentativeImage
+      ? overlays.reduce((best, item) => {
+        const scoreOverlay = (overlay: typeof item) => overlay.boxes.reduce((score, box) => {
+          if (box.kind === 'face') return score + 10 + (box.confidence ?? 0.7)
+          if (box.kind === 'mouth') return score + 5 + (box.confidence ?? 0.7)
+          if (box.kind === 'person') return score + 1
+          return score
+        }, 0)
+        return scoreOverlay(item) > scoreOverlay(best) ? item : best
+      }, overlays[0])
+      : overlays.reduce((best, item) => Math.abs(item.timestamp - currentTime) < Math.abs(best.timestamp - currentTime) ? item : best, overlays[0]))
+    : undefined
+  const rawActiveBoxes = activeOverlay?.boxes ?? []
+  const representativeFaceBox = rawActiveBoxes
+    .filter((box) => box.kind === 'face')
+    .sort((a, b) => (b.confidence ?? 0.7) - (a.confidence ?? 0.7))[0]
+  const activeBoxes = isRepresentativeImage && representativeFaceBox ? [representativeFaceBox] : rawActiveBoxes
+  const hasActualBoxes = activeBoxes.length > 0
+  const boxKindCounts = activeBoxes.reduce<Record<string, number>>((acc, box) => {
+    acc[box.kind] = (acc[box.kind] ?? 0) + 1
+    return acc
+  }, {})
+  const overlayKindText = [
+    boxKindCounts.person ? `인물 ${boxKindCounts.person}` : '',
+    boxKindCounts.face ? `얼굴 ${boxKindCounts.face}` : '',
+    boxKindCounts.mouth ? `입술 ${boxKindCounts.mouth}` : '',
+  ].filter(Boolean).join(' · ')
+
+  return (
+    <div className="multimodal-source-stage">
+      {videoUrl ? (
+        <video
+          src={videoUrl}
+          className="visual-media source-overlay-video"
+          controls
+          loop
+          autoPlay
+          playsInline
+          onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
+          onLoadedMetadata={(event) => setCurrentTime(event.currentTarget.currentTime)}
+        />
+      ) : (
+        <SourceOverlayMedia analysis={analysis} upload={upload} />
+      )}
+      <div className={`source-evidence-layer ${hasActualBoxes ? 'has-detections' : 'is-empty'} ${isRepresentativeImage ? 'is-face-priority' : 'is-live-video'}`} aria-label="원본 영상 위 실제 감지 단서">
+        <div className="source-scan-grid" aria-hidden="true" />
+        <div className="source-scan-beam" aria-hidden="true" />
+        {activeBoxes.map((box) => (
+          <div
+            key={`${activeOverlay?.timestamp}-${box.kind}-${box.x}-${box.y}`}
+            className={`source-detected-box is-${box.kind}`}
+            style={{ left: `${box.x}%`, top: `${box.y}%`, width: `${box.width}%`, height: `${box.height}%`, ['--box-confidence' as string]: String(box.confidence ?? 0.72) } as CSSProperties}
+          >
+            <i className="source-box-corner is-tl" />
+            <i className="source-box-corner is-tr" />
+            <i className="source-box-corner is-bl" />
+            <i className="source-box-corner is-br" />
+            <span><b>{box.label}</b>{typeof box.confidence === 'number' ? <em>{Math.round(box.confidence * 100)}%</em> : null}</span>
+          </div>
+        ))}
+        {!hasActualBoxes ? <div className="source-overlay-empty">현재 표시 시점에 인물·얼굴·입술·자막 감지 좌표가 없습니다.</div> : null}
+        <div className="source-overlay-readout">
+          <span>{isRepresentativeImage ? 'SINGLE FACE EVIDENCE' : 'LIVE EVIDENCE OVERLAY'}</span>
+          <strong>{activeOverlay ? `${activeOverlay.timeLabel} 샘플` : '샘플 대기'}</strong>
+          <p>{overlayKindText || '표시 가능한 감지 단서 없음'}</p>
+        </div>
+        <div className="source-signal-badges">
+          <b className={boxKindCounts.person ? 'is-active' : 'is-muted'}>인물 {boxKindCounts.person ? '감지' : '미표시'}</b>
+          <b className={boxKindCounts.face ? 'is-active' : 'is-muted'}>얼굴 {boxKindCounts.face ? '감지' : '미표시'}</b>
+          <b className={boxKindCounts.mouth ? 'is-active' : 'is-muted'}>MediaPipe 입술 {boxKindCounts.mouth ? '감지' : '미표시'}</b>
+          <b className={analysis.availability?.hasSpeech ? 'is-active' : 'is-muted'}>음성 단서 {analysis.availability?.hasSpeech ? '감지' : '부족'}</b>
+          <b className={analysis.availability?.hasText ? 'is-active' : 'is-muted'}>자막/텍스트 {analysis.availability?.hasText ? '감지' : '부족'}</b>
+        </div>
+        <div className="source-audio-ribbon source-audio-ribbon-actual">
+          {(analysis.syncBins ?? [18, 32, 44, 36, 52, 40, 24, 30]).slice(0, 8).map((value, index) => <i key={`audio-${value}-${index}`} style={{ height: `${Math.max(12, value)}%` }} />)}
+          <span>음성 에너지</span>
+        </div>
+        <div className="source-window-strip">
+          {frameRows.slice(0, 3).map((row) => <b key={`window-${row.label}`}>{row.range}</b>)}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function padSeries(series: number[], target = 6, fallback = 42): number[] {
   const normalized = series.filter((value) => Number.isFinite(value)).map((value) => Math.max(8, Math.min(100, value)))
   if (!normalized.length) return Array.from({ length: target }, () => fallback)
@@ -1074,7 +1214,7 @@ function modeLabel(mode?: string): string {
     'mm-frequency': 'Frequency Fusion',
     'mm-scenegraph': 'SceneGraph GCN',
   }
-  return labels[mode ?? 'mm-flava'] ?? 'Selected model'
+  return labels[mode ?? 'mm-avsync'] ?? 'Selected model'
 }
 
 function modelSignalCaption(analysis: Analysis): string {
@@ -1161,7 +1301,7 @@ function modelSignalGuide(analysis: Analysis): { title: string; bullets: string[
 }
 
 function selectedJudgment(analysis: Analysis) {
-  const key = modeLabel(analysis.selectedMode ?? 'mm-flava')
+  const key = modeLabel(analysis.selectedMode ?? 'mm-avsync')
   return analysis.modalityJudgments?.find((item) => item.label.toLowerCase() === key.toLowerCase())
 }
 
@@ -1181,7 +1321,7 @@ function ConnectedModalitiesCard({ category }: { category: CategoryConfig }) {
 }
 
 function ModelSignalPanel({ analysis }: { analysis: Analysis }) {
-  const selectedMode = analysis.selectedMode ?? 'mm-flava'
+  const selectedMode = analysis.selectedMode ?? 'mm-avsync'
   const frameSeries = padSeries(analysis.timeline.map((slice) => slice.score * 100), 6, 46)
   const tokenSeries = padSeries(analysis.tokens.map((token) => token.weight * 100), 6, 38)
   const syncSeries = padSeries((analysis.syncBins ?? []).map((value) => value), 8, 28)
@@ -1416,7 +1556,7 @@ async function requestAnalysis(params: {
   }
 
   if (category.uploadKind === 'text') {
-    const response = await fetch('/multimodal-api/analyze-text', {
+    const response = await fetch('/api/analyze-text', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -1443,10 +1583,10 @@ async function requestAnalysis(params: {
   const normalizedUrl = upload.sourceUrl.trim()
   if (upload.sourceMode === 'url' && normalizedUrl) {
     const urlEndpoint = category.id === 'image'
-      ? '/multimodal-api/analyze-image-url'
+      ? '/api/analyze-image-url'
       : category.id === 'video'
-        ? '/multimodal-api/analyze-video-url'
-        : '/multimodal-api/analyze-url'
+        ? '/api/analyze-video-url'
+        : '/api/analyze-url'
     const response = await fetch(urlEndpoint, {
       method: 'POST',
       headers: {
@@ -1483,10 +1623,10 @@ async function requestAnalysis(params: {
   formData.append('settings', JSON.stringify(settings))
 
   const endpoint = category.id === 'image'
-    ? '/multimodal-api/analyze-image'
+    ? '/api/analyze-image'
     : category.id === 'video'
-      ? '/multimodal-api/analyze-video'
-      : (category.id === 'multimodal' || category.uploadKind === 'video' ? '/multimodal-api/analyze' : '/api/analyze-media')
+      ? '/api/analyze-video'
+      : (category.id === 'multimodal' || category.uploadKind === 'video' ? '/api/analyze' : '/api/analyze-media')
   const response = await fetch(endpoint, {
     method: 'POST',
     body: formData,
@@ -1729,7 +1869,21 @@ function CategoryGlyph({ category }: { category: CategoryId }) {
   return <svg viewBox="0 0 24 24" aria-hidden="true" className="category-glyph"><path d={path} /></svg>
 }
 
-function UploadZone({ category, upload, onUploadState }: { category: CategoryConfig; upload: UploadState; onUploadState: Dispatch<SetStateAction<UploadState>> }) {
+function UploadZone({
+  category,
+  upload,
+  onUploadState,
+  onAnalyze,
+  canAnalyze,
+  isAnalyzing,
+}: {
+  category: CategoryConfig
+  upload: UploadState
+  onUploadState: Dispatch<SetStateAction<UploadState>>
+  onAnalyze: () => void
+  canAnalyze: boolean
+  isAnalyzing: boolean
+}) {
   const inputRef = useRef<HTMLInputElement | null>(null)
   const supportsUrlInput = category.uploadKind === 'video' || category.id === 'image'
   const urlHelper = category.id === 'image'
@@ -1738,6 +1892,7 @@ function UploadZone({ category, upload, onUploadState }: { category: CategoryCon
   const urlLabel = category.id === 'image' ? '분석할 이미지 주소' : '분석할 영상 주소'
   const urlPlaceholder = category.id === 'image' ? 'https://example.com/image.jpg' : 'https://www.youtube.com/watch?v=...'
   const emptyUrlPrompt = category.id === 'image' ? '분석할 이미지 주소를 입력해 주세요' : '분석할 영상 주소를 입력해 주세요'
+  const hasReadyInput = canAnalyze && (upload.sourceMode === 'url' || upload.file !== null || (category.uploadKind === 'text' && upload.textValue.trim().length > 0))
 
   const setFile = async (file: File | null) => {
     if (!file) return
@@ -1811,8 +1966,8 @@ function UploadZone({ category, upload, onUploadState }: { category: CategoryCon
           <span className="upload-label">{category.kicker}</span>
           <strong>{supportsUrlInput && upload.sourceMode === 'url' ? (upload.sourceUrl.trim() || emptyUrlPrompt) : (upload.file?.name ?? '파일을 올려 주세요')}</strong>
         </div>
-        {supportsUrlInput && upload.sourceMode === 'url' ? (
-          <button type="button" className="secondary-cta" onClick={() => onUploadState((current) => ({ ...current, sourceMode: 'file', sourceUrl: '' }))}>파일로 전환</button>
+        {hasReadyInput ? (
+          <button type="button" className="primary-cta" onClick={onAnalyze} disabled={!canAnalyze || isAnalyzing}>{isAnalyzing ? '분석 중...' : '진위 판별 시작'}</button>
         ) : (
           <button type="button" className="secondary-cta" onClick={() => inputRef.current?.click()}>{category.uploadKind === 'text' ? 'TXT 업로드' : '파일 선택'}</button>
         )}
@@ -1827,12 +1982,16 @@ function ProgressRail({
   isLive,
   statusLabel,
   statusDetail,
+  category,
+  upload,
 }: {
   stages: string[]
   progress: number
   isLive: boolean
   statusLabel: string
   statusDetail: string
+  category: CategoryConfig
+  upload: UploadState
 }) {
   const stageThresholds = [18, 52, 86, 100]
   return (
@@ -1845,9 +2004,89 @@ function ProgressRail({
         </div>
         <div className="progress-percent-box"><strong>{Math.round(progress)}%</strong><span>{progress < 100 ? '응답 대기 기준' : '완료'}</span></div>
       </div>
+      <AnalysisScanPreview category={category} upload={upload} isLive={isLive} statusLabel={statusLabel} progress={progress} />
       <div className="progress-track"><div className="progress-fill" style={{ width: `${progress}%` }} /><div className={`progress-glow ${isLive ? 'is-live' : ''}`} style={{ left: `${progress}%` }} /></div>
       <div className="progress-stage-row">{stages.map((stage, index) => <div key={stage} className={`progress-stage ${progress >= (stageThresholds[index] ?? ((index + 1) / stages.length) * 100) ? 'is-active' : ''}`}><span>{String(index + 1).padStart(2, '0')}</span><strong>{stage}</strong></div>)}</div>
     </section>
+  )
+}
+
+function AnalysisScanPreview({
+  category,
+  upload,
+  isLive,
+  statusLabel,
+  progress,
+}: {
+  category: CategoryConfig
+  upload: UploadState
+  isLive: boolean
+  statusLabel: string
+  progress: number
+}) {
+  const directVideoUrl = upload.sourceMode === 'url' && canRenderDirectVideoUrl(upload.sourceUrl) ? upload.sourceUrl.trim() : ''
+  const trimmedUrl = upload.sourceUrl.trim()
+  const youtubeVideoId = upload.sourceMode === 'url' ? extractYouTubeVideoId(trimmedUrl) : ''
+  const textPreview = upload.textValue.trim()
+  const fileLabel = upload.file?.name ?? (trimmedUrl || `${categoryNameKo(category.id)} 입력`)
+
+  let content: ReactNode
+  if (upload.previewUrl && upload.file?.type.startsWith('image/')) {
+    content = <img src={upload.previewUrl} alt="분석 입력 이미지 미리보기" className="analysis-scan-media" />
+  } else if (upload.previewUrl && upload.file?.type.startsWith('video/')) {
+    content = <video src={upload.previewUrl} className="analysis-scan-media" controls loop autoPlay playsInline />
+  } else if (directVideoUrl) {
+    content = <video src={directVideoUrl} className="analysis-scan-media" controls loop autoPlay playsInline />
+  } else if (youtubeVideoId && (category.id === 'video' || category.id === 'multimodal')) {
+    content = (
+      <iframe
+        className="analysis-scan-media analysis-scan-youtube"
+        src={`https://www.youtube.com/embed/${youtubeVideoId}?autoplay=1&mute=0&loop=1&playlist=${youtubeVideoId}&controls=1&modestbranding=1&playsinline=1&rel=0`}
+        title="분석 입력 YouTube 영상 미리보기"
+        allow="autoplay; encrypted-media; picture-in-picture"
+        allowFullScreen
+      />
+    )
+  } else if (category.uploadKind === 'text' || textPreview) {
+    content = (
+      <div className="analysis-scan-text">
+        <span>TEXT INPUT</span>
+        <p>{textPreview || '입력된 텍스트를 분석 요청으로 준비하고 있습니다.'}</p>
+      </div>
+    )
+  } else if (trimmedUrl) {
+    content = (
+      <div className="analysis-scan-url">
+        <CategoryGlyph category={category.id} />
+        <span>URL TARGET</span>
+        <strong>{trimmedUrl}</strong>
+      </div>
+    )
+  } else {
+    content = (
+      <div className="analysis-scan-url">
+        <CategoryGlyph category={category.id} />
+        <span>INPUT TARGET</span>
+        <strong>{fileLabel}</strong>
+      </div>
+    )
+  }
+
+  return (
+    <div className={`analysis-scan-preview ${isLive ? 'is-live' : ''}`}>
+      <div className="analysis-scan-stage">
+        {content}
+        <div className="analysis-scan-grid" aria-hidden="true" />
+        <div className="analysis-scan-beam" aria-hidden="true" />
+        <div className="analysis-scan-line" aria-hidden="true" />
+        <div className="analysis-scan-hud">
+          <span>{categoryNameKo(category.id)} scan</span>
+          <strong>{statusLabel}</strong>
+          <small>{fileLabel}</small>
+        </div>
+        <div className="analysis-scan-progress" style={{ ['--scan-progress' as string]: `${Math.max(4, Math.min(100, progress))}%` } as CSSProperties} aria-hidden="true" />
+      </div>
+    </div>
   )
 }
 
@@ -1893,6 +2132,93 @@ function getTextInputIssue(text: string): string | null {
     return '텍스트가 너무 짧아 신뢰할 수 있는 판별을 진행하지 않았습니다. 최소 두 문장 이상, 30자 이상으로 입력해 주세요.'
   }
   return null
+}
+
+function ResultReadingSummary({ category, analysis }: { category: CategoryConfig; analysis: Analysis }) {
+  const isFake = analysis.fakePercent >= analysis.realPercent
+  const dominantPercent = Math.max(analysis.realPercent, analysis.fakePercent)
+  const topMetric = analysis.metrics[0]
+  const topReason = analysis.reasons[0]
+  const topBar = analysis.bars.length
+    ? [...analysis.bars].sort((a, b) => b.score - a.score)[0]
+    : undefined
+  const topSlice = analysis.timeline.length
+    ? [...analysis.timeline].sort((a, b) => b.score - a.score)[0]
+    : undefined
+  const topModality = analysis.modalityJudgments?.length
+    ? [...analysis.modalityJudgments].sort((a, b) => Math.max(b.realPercent, b.fakePercent) - Math.max(a.realPercent, a.fakePercent))[0]
+    : undefined
+  const evidenceLabel = category.id === 'multimodal'
+    ? topModality?.label ?? topBar?.label ?? topMetric?.label ?? '종합 단서'
+    : category.id === 'text'
+      ? topSlice?.label ?? topBar?.label ?? '문장/표현 신호'
+      : topBar?.label ?? topMetric?.label ?? '핵심 시각 단서'
+  const evidenceBody = category.id === 'multimodal'
+    ? topModality?.reason ?? topReason?.body ?? '모달리티별 점수와 정합성 관계를 함께 확인하세요.'
+    : category.id === 'text'
+      ? topSlice?.note ?? topReason?.body ?? '문장 span과 표현 하이라이트를 함께 확인하세요.'
+      : topReason?.body ?? topBar?.note ?? '시각화된 단서와 세부 타임라인을 함께 확인하세요.'
+  const nextTarget = category.id === 'multimodal'
+    ? topSlice ? `${topSlice.label} ${topSlice.start}-${topSlice.end}` : '정합성 지도'
+    : category.id === 'text'
+      ? topSlice ? `${topSlice.label} 문장 해석` : '표현 하이라이트'
+      : category.id === 'video'
+        ? topSlice ? `${topSlice.label} 프레임` : '대표 프레임'
+        : 'XAI 시각화'
+  const cards = [
+    {
+      step: '01',
+      label: '최종 판정',
+      title: `${analysis.verdictLabel} · ${formatPercent(dominantPercent)}`,
+      body: `Real ${formatPercent(analysis.realPercent)} / Fake ${formatPercent(analysis.fakePercent)} 기준으로 먼저 판정 방향을 확인합니다.`,
+    },
+    {
+      step: '02',
+      label: '핵심 근거',
+      title: evidenceLabel,
+      body: evidenceBody,
+    },
+    {
+      step: '03',
+      label: '먼저 볼 위치',
+      title: nextTarget,
+      body: category.id === 'multimodal'
+        ? '영상 위 감지 단서, 구간별 점수, 정합성 지도를 순서대로 보면 결과 흐름이 가장 잘 보입니다.'
+        : category.id === 'text'
+          ? '문장별 점수와 하이라이트된 표현을 함께 보되, 단어 하나를 단독 원인으로 해석하지 않습니다.'
+          : '시각화 패널에서 표시된 영역을 먼저 보고, 필요하면 세부 타임라인을 펼쳐 확인합니다.',
+    },
+    {
+      step: '04',
+      label: '해석 기준',
+      title: isFake ? '의심 신호 중심으로 확인' : '정합 신호 중심으로 확인',
+      body: '이 결과는 최종 사실 확인을 대체하지 않는 보조 판단 도구입니다. 수치와 설명 근거를 함께 읽어야 합니다.',
+    },
+  ]
+
+  return (
+    <section className="result-reading-summary" aria-label="결과 읽는 순서">
+      <div className="result-reading-head">
+        <div>
+          <span className="eyebrow">READING ORDER</span>
+          <h3>결과는 이 순서로 보면 됩니다</h3>
+        </div>
+        <div className={`result-reading-badge ${isFake ? 'is-fake' : 'is-real'}`}>
+          <span>{isFake ? 'Fake-side' : 'Real-side'}</span>
+          <strong>{formatPercent(dominantPercent)}</strong>
+        </div>
+      </div>
+      <div className="result-reading-grid">
+        {cards.map((card) => (
+          <article key={card.step} className="result-reading-card">
+            <span>{card.step} · {card.label}</span>
+            <strong>{card.title}</strong>
+            <p>{card.body}</p>
+          </article>
+        ))}
+      </div>
+    </section>
+  )
 }
 
 function TextResultDashboard({ analysis, profile }: { analysis: Analysis; profile: Profile }) {
@@ -2055,6 +2381,7 @@ function TextResultDashboard({ analysis, profile }: { analysis: Analysis; profil
         </div>
       </div>
 
+      <ResultReadingSummary category={CATEGORY_CONFIG.text} analysis={analysis} />
       <XaiTrustNotice compact />
       <ResultInterpretationGuide category={CATEGORY_CONFIG.text} analysis={analysis} />
 
@@ -2457,18 +2784,18 @@ function VideoXaiDashboard({ analysis }: { analysis: Analysis }) {
 
       <div className="video-xai-split">
         <article className="video-frame-preview-panel">
-          <div className="panel-header compact"><div><span className="eyebrow">MODEL INPUT</span><h3>{videoXai.topFrameLabel} 원본과 text mask 입력</h3></div></div>
+          <div className="panel-header compact"><div><span className="eyebrow">MODEL INPUT</span><h3>{videoXai.topFrameLabel} 원본과 마스크 적용 프레임</h3></div></div>
           <div className="video-mask-preview-grid">
             <div>
-              {analysis.focusFrameUrl ? <img src={analysis.focusFrameUrl} alt="sampled original frame" /> : null}
+              {(videoXai.originalFocusFrame || analysis.focusFrameUrl) ? <img src={videoXai.originalFocusFrame || analysis.focusFrameUrl} alt="sampled original frame" /> : null}
               <span>원본 대표 프레임</span>
             </div>
             <div>
               {videoXai.maskedFocusFrame ? <img src={videoXai.maskedFocusFrame} alt="masked model input frame" /> : null}
-              <span>모델 입력 프레임</span>
+              <span>마스크 적용 영역 시각화</span>
             </div>
           </div>
-          <p>상단 8%와 하단 18% band를 median 색으로 가린 뒤 모델에 입력합니다. 자막, 로고, 플랫폼 UI가 판정 shortcut이 되지 않게 하기 위한 전처리입니다.</p>
+          <p>상단 8%와 하단 18% band를 median 색으로 가린 뒤 모델에 입력합니다. 오른쪽의 파란 가이드는 어떤 영역이 가려졌는지 쉽게 보이도록 덧씌운 화면용 표시입니다.</p>
         </article>
 
         <article className="video-matrix-panel">
@@ -2512,13 +2839,447 @@ function ResultDashboard({ analysis, upload, category, profile, llmSectionStatus
     return analysis.llmSections?.[key] ?? fallback
   }
 
+  const multimodalInputs = analysis.availability
+    ? [
+        { label: '얼굴', active: analysis.availability.hasFace, value: Math.round(analysis.availability.faceRatio * 100), suffix: '% 프레임에서 얼굴 확인' },
+        { label: '입술', active: analysis.availability.hasLips, value: Math.round(analysis.availability.mouthRatio * 100), suffix: '% 프레임에서 입술 추적' },
+        { label: '음성', active: analysis.availability.hasSpeech, value: Math.round(analysis.availability.speechConfidence * 100), suffix: '% 수준의 단서' },
+        { label: '텍스트', active: analysis.availability.hasText, value: Math.round(analysis.availability.textConfidence * 100), suffix: '% 수준의 단서' },
+      ]
+    : []
+  const multimodalActiveCount = multimodalInputs.filter((item) => item.active).length
+  const multimodalJudgments = analysis.modalityJudgments ?? []
+  const multimodalFakeCount = multimodalJudgments.filter((item) => item.fakePercent >= item.realPercent).length
+  const multimodalRealCount = multimodalJudgments.length - multimodalFakeCount
+  const multimodalDominantJudgment = multimodalJudgments.length
+    ? [...multimodalJudgments].sort((a, b) => Math.max(b.fakePercent, b.realPercent) - Math.max(a.fakePercent, a.realPercent))[0]
+    : undefined
+  const multimodalRiskJudgment = multimodalJudgments.length
+    ? [...multimodalJudgments].sort((a, b) => (b.fakePercent - b.realPercent) - (a.fakePercent - a.realPercent))[0]
+    : undefined
+  const multimodalPeakSlice = analysis.timeline.length
+    ? [...analysis.timeline].sort((a, b) => b.score - a.score)[0]
+    : undefined
+  const multimodalFusionTop = analysis.fusionWeights?.length ? analysis.fusionWeights[0] : undefined
+  const multimodalSignalChecklist = [
+    { label: '얼굴', icon: '🙂', active: analysis.availability?.hasFace ?? false, detail: analysis.availability ? `${Math.round(analysis.availability.faceRatio * 100)}% 프레임에서 얼굴 확인` : '확인 전' },
+    { label: '입술', icon: '👄', active: analysis.availability?.hasLips ?? false, detail: analysis.availability ? `${Math.round(analysis.availability.mouthRatio * 100)}% 프레임에서 입술 추적` : '확인 전' },
+    { label: '음성', icon: '🎙️', active: analysis.availability?.hasSpeech ?? false, detail: analysis.availability ? `${Math.round(analysis.availability.speechConfidence * 100)}% 수준의 음성 단서` : '확인 전' },
+    { label: '자막/텍스트', icon: '📝', active: analysis.availability?.hasText ?? false, detail: analysis.availability ? `${Math.round(analysis.availability.textConfidence * 100)}% 수준의 자막/문장 단서` : '확인 전' },
+    { label: '프레임', icon: '🎞️', active: Boolean(analysis.processingScope?.sampleFrames || analysis.timeline.length), detail: analysis.processingScope ? `${analysis.processingScope.sampleFrames} frames` : `${analysis.timeline.length} spans` },
+    { label: '주파수', icon: '📡', active: Boolean(analysis.frequencyComparison || analysis.spectrumBins?.length), detail: analysis.frequencyComparison ? 'FFT compared' : '보조 근거' },
+  ]
+  const multimodalFrameUseRows = analysis.processingScope?.windows?.length
+    ? analysis.processingScope.windows.map((sampleWindow, index) => {
+        const slice = analysis.timeline[index] ?? multimodalPeakSlice
+        return {
+          label: sampleWindow.label,
+          range: `${sampleWindow.startLabel} - ${sampleWindow.endLabel}`,
+          score: slice ? slice.score * 100 : 0,
+          verdict: slice ? (slice.score >= 0.5 ? 'Fake 신호 확인' : 'Real 정합성 확인') : '샘플 구간',
+          note: slice?.note ?? '대표 프레임과 오디오/자막 단서를 함께 읽은 구간입니다.',
+        }
+      })
+    : analysis.timeline.slice(0, 3).map((slice) => ({
+        label: slice.label,
+        range: `${slice.start} - ${slice.end}`,
+        score: slice.score * 100,
+        verdict: slice.score >= 0.5 ? 'Fake 신호 확인' : 'Real 정합성 확인',
+        note: slice.note,
+      }))
+
+  const judgeByLabel = (pattern: RegExp) => multimodalJudgments.find((item) => pattern.test(item.label))
+  const relationTone = (fakePercent: number, realPercent: number) => fakePercent >= realPercent ? 'fake' : 'real'
+  const relationPercent = (fakePercent: number, realPercent: number) => Math.max(fakePercent, realPercent)
+  const relationLabel = (fakePercent: number, realPercent: number) => fakePercent >= realPercent ? '어긋남 쪽 근거' : '정합 쪽 근거'
+  const relationStrengthText = (score: number) => score >= 70 ? '강한 근거' : score >= 56 ? '보통 근거' : score >= 45 ? '약한 근거' : '해석 제한'
+  const relationScoreNote = '아래 반영 비중은 이 결과 설명 안에서 각 관계가 차지한 상대적 비중입니다. 5개 관계의 합은 100%가 되도록 정규화했습니다.'
+  const readableModelReason = (reason: string) => reason
+    .replaceAll('가용성이 낮아', '분석에 충분한 단서가 적어')
+    .replaceAll('가용성이 낮', '분석 단서가 적')
+    .replaceAll('gated down', '낮은 비중 처리')
+    .replaceAll('gate down', '낮은 비중 처리')
+  const avSyncJudgment = judgeByLabel(/AVSync|Audio|Sync/i)
+  const textJudgment = judgeByLabel(/OpenCLIP|BLIP|Text|NLI/i)
+  const structureJudgment = judgeByLabel(/SceneGraph|Structure|Vision|Temporal/i)
+  const frequencyJudgment = judgeByLabel(/Frequency|Audio/i)
+  const peakRelationSlice = multimodalPeakSlice ?? analysis.timeline[0]
+  const multimodalRelationRows = [
+    {
+      title: '얼굴 ↔ 입술',
+      tone: analysis.availability?.hasFace && analysis.availability?.hasLips ? 'real' : 'muted',
+      verdict: analysis.availability?.hasFace && analysis.availability?.hasLips ? '같은 인물에서 얼굴과 입술이 함께 잡힘' : '비교할 얼굴/입술 단서가 부족함',
+      score: analysis.availability ? Math.round(((analysis.availability.faceRatio + analysis.availability.mouthRatio) / 2) * 100) : 0,
+      body: analysis.availability?.hasFace && analysis.availability?.hasLips
+        ? `전체 샘플 중 얼굴은 ${Math.round((analysis.availability?.faceRatio ?? 0) * 100)}% 정도에서 보였고, 입술 움직임은 ${Math.round((analysis.availability?.mouthRatio ?? 0) * 100)}% 정도에서 따라갈 수 있었습니다. 즉 모델은 같은 인물 영역 안에서 얼굴 위치와 입 주변 움직임을 함께 확인했고, 이 관계는 인물 단서가 안정적이라는 설명 근거로 쓰였습니다.`
+        : '샘플 프레임에서 얼굴 또는 입술이 충분히 선명하게 잡히지 않았습니다. 이 경우 모델은 얼굴-입술 관계를 강한 판단 근거로 쓰지 않고, 다른 시각·음성·텍스트 단서의 비중을 더 크게 봅니다.',
+    },
+    {
+      title: '입술 ↔ 음성',
+      tone: avSyncJudgment ? relationTone(avSyncJudgment.fakePercent, avSyncJudgment.realPercent) : (analysis.availability?.hasLips && analysis.availability?.hasSpeech ? 'real' : 'muted'),
+      verdict: avSyncJudgment ? relationLabel(avSyncJudgment.fakePercent, avSyncJudgment.realPercent) : '발화 타이밍 비교',
+      score: avSyncJudgment ? relationPercent(avSyncJudgment.fakePercent, avSyncJudgment.realPercent) : Math.round(((analysis.availability?.mouthRatio ?? 0) + (analysis.availability?.speechConfidence ?? 0)) * 50),
+      body: analysis.availability?.hasLips && analysis.availability?.hasSpeech
+        ? (avSyncJudgment && avSyncJudgment.fakePercent >= avSyncJudgment.realPercent
+          ? `입술 움직임과 음성 에너지의 시작·강세 흐름을 비교했을 때 완전히 맞물리지 않는 쪽 신호가 더 컸습니다. ${formatPercent(avSyncJudgment.fakePercent)}는 최종 Fake 확률이 아니라, 입술-음성 관계가 Fake 설명에 기여한 근거 강도입니다.`
+          : `입술 움직임과 음성 에너지의 시작·강세 흐름이 비교적 자연스럽게 맞았습니다. ${formatPercent(avSyncJudgment ? avSyncJudgment.realPercent : 0)}는 최종 Real 확률이 아니라, 입술-음성 관계가 Real 설명에 기여한 근거 강도입니다.`)
+        : '입술 움직임이나 음성 파형 중 하나가 충분히 선명하지 않았습니다. 그래서 이 카드는 “입술과 음성이 명확히 어긋났다”는 뜻이 아니라, 비교 자체의 신뢰도가 낮아 보조 근거로만 사용했다는 뜻입니다.',
+    },
+    {
+      title: '장면 ↔ 자막/텍스트',
+      tone: textJudgment ? relationTone(textJudgment.fakePercent, textJudgment.realPercent) : (analysis.availability?.hasText ? 'real' : 'muted'),
+      verdict: textJudgment ? relationLabel(textJudgment.fakePercent, textJudgment.realPercent) : '장면과 문장 비교',
+      score: textJudgment ? relationPercent(textJudgment.fakePercent, textJudgment.realPercent) : Math.round((analysis.availability?.textConfidence ?? 0) * 100),
+      body: analysis.availability?.hasText
+        ? (textJudgment && textJudgment.fakePercent >= textJudgment.realPercent
+          ? `자막 또는 입력 텍스트가 화면에서 보이는 장면 설명과 충분히 맞물리지 않는 구간이 있어 Fake 쪽 설명 근거로 반영했습니다. ${formatPercent(textJudgment.fakePercent)}는 이 관계의 근거 강도입니다.`
+          : `자막 또는 입력 텍스트가 화면 내용과 크게 충돌하지 않아 Real 쪽 설명 근거로 반영했습니다. ${formatPercent(textJudgment ? textJudgment.realPercent : 0)}는 이 관계의 근거 강도입니다.`)
+        : '자막이나 함께 입력된 설명 문장이 거의 없어, 장면-텍스트 일치 여부를 강하게 판단하기 어렵습니다. 이 경우 모델은 텍스트 관계보다 프레임, 얼굴, 주파수 같은 다른 단서를 중심으로 결과를 설명합니다.',
+    },
+    {
+      title: '프레임 흐름 ↔ 장면 구조',
+      tone: structureJudgment ? relationTone(structureJudgment.fakePercent, structureJudgment.realPercent) : (peakRelationSlice && peakRelationSlice.score >= 0.5 ? 'fake' : 'real'),
+      verdict: structureJudgment ? relationLabel(structureJudgment.fakePercent, structureJudgment.realPercent) : '시간 구간별 흐름 비교',
+      score: structureJudgment ? relationPercent(structureJudgment.fakePercent, structureJudgment.realPercent) : Math.round((peakRelationSlice?.score ?? 0) * 100),
+      body: structureJudgment
+        ? `${readableModelReason(structureJudgment.reason)} 이 값은 얼굴·객체 위치, 장면 전환, 시간 흐름이 한 방향의 설명 근거로 얼마나 강하게 모였는지를 보여줍니다.`
+        : (peakRelationSlice
+          ? `${peakRelationSlice.label}(${peakRelationSlice.start}-${peakRelationSlice.end}) 구간에서 프레임 흐름 점수가 가장 크게 반영되었습니다. ${peakRelationSlice.note}`
+          : '대표 프레임의 흐름과 장면 구조를 함께 확인했습니다.'),
+    },
+    {
+      title: '음성 ↔ 주파수',
+      tone: frequencyJudgment ? relationTone(frequencyJudgment.fakePercent, frequencyJudgment.realPercent) : (analysis.frequencyComparison ? 'real' : 'muted'),
+      verdict: frequencyJudgment ? relationLabel(frequencyJudgment.fakePercent, frequencyJudgment.realPercent) : '소리 패턴과 주파수 비교',
+      score: frequencyJudgment ? relationPercent(frequencyJudgment.fakePercent, frequencyJudgment.realPercent) : Math.max(...(analysis.frequencyComparison?.sample ?? analysis.spectrumBins ?? [0])),
+      body: frequencyJudgment
+        ? `${readableModelReason(frequencyJudgment.reason)} 여기서 %는 오디오/주파수 관계가 Real 또는 Fake 설명에 기여한 근거 강도이며, 최종 판정 확률과는 구분해서 봐야 합니다.`
+        : (analysis.frequencyComparison?.note ?? '현재 영상의 소리·주파수 분포를 비교용 기준 패턴과 함께 확인했습니다.'),
+    },
+  ]
+
+  const relationTotalStrength = multimodalRelationRows.reduce((sum, row) => sum + Math.max(row.score, 0), 0) || 1
+  const relationContributionRows = multimodalRelationRows.map((row) => ({
+    ...row,
+    contribution: Number(((Math.max(row.score, 0) / relationTotalStrength) * 100).toFixed(1)),
+  }))
+  const modelJudgmentByPattern = (pattern: RegExp) => multimodalJudgments.find((item) => pattern.test(item.label))
+  const hasFusionWeights = Boolean(analysis.fusionWeights?.length)
+  const fusionWeightByPattern = (pattern: RegExp) => analysis.fusionWeights?.find((item) => pattern.test(item.label))?.weight ?? 0
+  const relationMatches = relationContributionRows.filter((row) => row.tone === 'real').sort((a, b) => b.contribution - a.contribution)
+  const relationMismatches = relationContributionRows.filter((row) => row.tone === 'fake').sort((a, b) => b.contribution - a.contribution)
+  const relationLimited = relationContributionRows.filter((row) => row.tone === 'muted').sort((a, b) => b.contribution - a.contribution)
+  const topConsistencySignal = relationMismatches[0] ?? relationMatches[0] ?? relationLimited[0]
+  const modelArchitectureRows = [
+    {
+      id: 'openclip',
+      model: 'OpenCLIP',
+      input: '프레임 + 자막/입력 문장',
+      architecture: 'Visual encoder와 text encoder가 같은 의미 공간에서 장면-문장 거리를 비교합니다.',
+      role: '장면과 설명이 같은 내용을 가리키는지 확인',
+      weight: fusionWeightByPattern(/OpenCLIP/i),
+      judgment: modelJudgmentByPattern(/OpenCLIP/i),
+    },
+    {
+      id: 'flava',
+      model: 'FLAVA',
+      input: '영상 프레임 + 언어 단서',
+      architecture: '비전·언어 표현을 하나의 멀티모달 표현으로 묶어 전반 정합성을 봅니다.',
+      role: '시각 단서와 언어 단서의 통합 판단',
+      weight: fusionWeightByPattern(/FLAVA/i),
+      judgment: modelJudgmentByPattern(/FLAVA/i),
+    },
+    {
+      id: 'blip-nli',
+      model: 'BLIP + NLI',
+      input: '장면 설명 + 자막/텍스트',
+      architecture: '장면 설명을 만들고, 그 설명과 텍스트 사이의 모순 가능성을 확인합니다.',
+      role: '화면 설명과 문장 의미가 충돌하는지 확인',
+      weight: fusionWeightByPattern(/BLIP|NLI/i),
+      judgment: modelJudgmentByPattern(/BLIP|NLI|Text/i),
+    },
+    {
+      id: 'avsync',
+      model: 'AVSync',
+      input: '입술 움직임 + 음성 에너지',
+      architecture: '입 주변 움직임과 오디오 onset·강세 흐름의 시간 차이를 비교합니다.',
+      role: '말하는 타이밍과 입 움직임이 맞는지 확인',
+      weight: fusionWeightByPattern(/AVSync|Audio/i),
+      judgment: modelJudgmentByPattern(/AVSync|Audio|Sync/i),
+    },
+    {
+      id: 'frequency',
+      model: 'Frequency',
+      input: '프레임/오디오 주파수',
+      architecture: 'FFT·주파수 분포에서 생성형 잔여 패턴이 강한지 비교합니다.',
+      role: '시각·음성 포렌식 패턴 확인',
+      weight: fusionWeightByPattern(/Frequency/i),
+      judgment: modelJudgmentByPattern(/Frequency/i),
+    },
+    {
+      id: 'scenegraph',
+      model: 'SceneGraph',
+      input: '얼굴·객체·장면 구조',
+      architecture: '장면 안의 객체 위치와 관계 구조가 시간 흐름에서 안정적인지 확인합니다.',
+      role: '인물·객체 관계와 장면 구조 안정성 확인',
+      weight: fusionWeightByPattern(/SceneGraph|Structure/i),
+      judgment: modelJudgmentByPattern(/SceneGraph|Structure/i),
+    },
+  ].map((item) => {
+    const realPercent = item.judgment?.realPercent ?? (analysis.realPercent >= analysis.fakePercent ? analysis.realPercent : 100 - analysis.fakePercent)
+    const fakePercent = item.judgment?.fakePercent ?? (analysis.fakePercent >= analysis.realPercent ? analysis.fakePercent : 100 - analysis.realPercent)
+    const tone = fakePercent >= realPercent ? 'fake' : 'real'
+    return {
+      ...item,
+      realPercent,
+      fakePercent,
+      tone,
+      signal: Math.max(realPercent, fakePercent),
+      verdict: item.judgment?.verdict ?? (tone === 'fake' ? 'Fake 쪽 근거' : 'Real 쪽 근거'),
+      reason: item.judgment ? readableModelReason(item.judgment.reason) : '해당 모델의 세부 점수가 없을 때는 최종 융합 방향과 입력 단서 상태를 기준으로 보조 설명합니다.',
+      weight: hasFusionWeights ? item.weight : Math.round(100 / 6),
+    }
+  })
+
+  const architectureModeIdMap: Record<string, string> = {
+    'mm-openclip': 'openclip',
+    'mm-flava': 'flava',
+    'mm-blip-nli': 'blip-nli',
+    'mm-avsync': 'avsync',
+    'mm-frequency': 'frequency',
+    'mm-scenegraph': 'scenegraph',
+  }
+  const selectedArchitectureId = architectureModeIdMap[analysis.selectedMode ?? ''] ?? 'avsync'
+  type ArchitectureStage = { title: string; op: string; shape: string; kind: 'input' | 'encoder' | 'embedding' | 'head' | 'gate' | 'fusion' | 'output' }
+  type ArchitectureBlueprint = {
+    family: string
+    code: string
+    tensor: string
+    layout: 'contrastive' | 'service-head' | 'sync' | 'spectral' | 'graph'
+    stages: ArchitectureStage[]
+    equations: string[]
+    featureGroups: string[]
+  }
+  const architectureBlueprintMap: Record<string, ArchitectureBlueprint> = {
+    openclip: {
+      family: 'OpenCLIP ViT-L/14 dual encoder',
+      code: 'ensure_model() -> clip_real_fake() -> encode_image/encode_text -> cosine',
+      tensor: 'face_crop/frame_rgb + prompt/text -> normalized d_clip embeddings',
+      layout: 'contrastive',
+      stages: [
+        { title: 'Frame ROI', op: 'representative.face_crop', shape: 'RGB 224x224', kind: 'input' },
+        { title: 'Vision Transformer', op: 'model.encode_image(image)', shape: 'z_img / ||z_img||', kind: 'encoder' },
+        { title: 'Text Transformer', op: 'tokenizer(prompts + text) -> encode_text', shape: 'z_txt / ||z_txt||', kind: 'encoder' },
+        { title: 'Shared Space', op: 'cos(z_img, z_txt)', shape: '[-1, 1] -> [0, 1]', kind: 'embedding' },
+        { title: 'OpenCLIP Score', op: 'real/fake prompt softmax + text_alignment', shape: 'prob_fake_openclip', kind: 'output' },
+      ],
+      equations: ['real=(p0+p1)/sum(p)', 'fake=(p2+p3)/sum(p)', 'text_alignment=(cos+1)/2'],
+      featureGroups: ['Authentic prompts', 'Synthetic prompts', 'Companion text', 'Representative ROI'],
+    },
+    flava: {
+      family: 'ServiceHeadNet multimodal feature head',
+      code: 'predict_service_head(method=flava), 0.65*head + 0.35*OpenCLIP anchor',
+      tensor: '17-D service vector -> z-score -> MLP',
+      layout: 'service-head',
+      stages: [
+        { title: 'Feature Vector', op: 'openclip + segment + face + mouth + audio + motion + text', shape: 'R^17', kind: 'input' },
+        { title: 'Normalize', op: '(x - mean) / std', shape: 'z-score', kind: 'gate' },
+        { title: 'MLP Block 1', op: 'Linear(17,24) + ReLU + Dropout(.05)', shape: 'R^24', kind: 'head' },
+        { title: 'MLP Block 2', op: 'Linear(24,12) + ReLU', shape: 'R^12', kind: 'head' },
+        { title: 'Anchor Mix', op: '0.65*sigmoid(head) + 0.35*prob_fake_openclip', shape: 'prob_fake_flava', kind: 'output' },
+      ],
+      equations: ['x=[clip, segment, face, mouth, audio, motion, text]', 'score=sigmoid(Linear12->1)', 'out=0.65*score+0.35*anchor'],
+      featureGroups: ['segment_mean/topk/peak', 'face_detect_ratio', 'mouth_track_ratio', 'audio_energy_mean/std', 'motion_mean', 'text_tokens'],
+    },
+    'blip-nli': {
+      family: 'Text-scene consistency service head',
+      code: 'predict_service_head(method=blip_nli) + text gate',
+      tensor: '12-D scene/text consistency vector -> MLP',
+      layout: 'service-head',
+      stages: [
+        { title: 'Scene/Text Vector', op: 'openclip + segment + face + sharpness + text_tokens', shape: 'R^12', kind: 'input' },
+        { title: 'Text Gate', op: 'text_tokens < 3 -> gate=.10 / neutral contraction', shape: 'gate_blip_nli', kind: 'gate' },
+        { title: 'MLP Block 1', op: 'Linear(12,24) + ReLU + Dropout(.05)', shape: 'R^24', kind: 'head' },
+        { title: 'MLP Block 2', op: 'Linear(24,12) + ReLU', shape: 'R^12', kind: 'head' },
+        { title: 'Consistency Score', op: '0.65*head + 0.35*OpenCLIP anchor', shape: 'prob_fake_blip_nli', kind: 'output' },
+      ],
+      equations: ['text_missing -> contract_toward_neutral', 'gated_rel=prob*gate*(.70+.30*reliability)', 'out=anchor mixed service score'],
+      featureGroups: ['prob_fake_openclip', 'visual_sharpness', 'text_tokens', 'precheck/reliability', 'segment stats'],
+    },
+    avsync: {
+      family: 'Temporal AV synchronization head',
+      code: 'audio_features() + motion_audio_sync() + predict_service_head(method=avsync)',
+      tensor: 'mouth motion series + RMS audio envelope -> lag/correlation features',
+      layout: 'sync',
+      stages: [
+        { title: 'Face/Mouth Track', op: 'face_box, mouth_box, mouth_track_ratio', shape: 'T boxes', kind: 'input' },
+        { title: 'Audio Envelope', op: 'RMS 80ms window, hop 40ms', shape: 'T audio bins', kind: 'input' },
+        { title: 'Lag Search', op: 'corr(motion[t], audio[t+lag]), lag=-4..4', shape: 'best_corr, best_lag', kind: 'encoder' },
+        { title: 'Availability Gate', op: 'face<.30 or mouth<.20 or audio<q -> gate=.05', shape: 'gate_avsync', kind: 'gate' },
+        { title: 'AVSync Head', op: 'ServiceHeadNet + anchor mix', shape: 'prob_fake_avsync', kind: 'output' },
+      ],
+      equations: ['sync=(best_corr+1)/2', 'if no speech/lips: contract_toward_neutral(.30)', 'out=service_head(x) mixed with OpenCLIP'],
+      featureGroups: ['face_detect_ratio', 'mouth_track_ratio', 'audio_energy_mean/std', 'motion_mean', 'lag frames'],
+    },
+    frequency: {
+      family: 'Spectral forensic service head',
+      code: 'fft_artifact_score() + audio_features() + predict_service_head(method=frequency)',
+      tensor: 'FFT(frame/audio) + segment statistics -> MLP',
+      layout: 'spectral',
+      stages: [
+        { title: 'Visual FFT', op: 'torch.fft.fft2 -> fftshift -> log magnitude', shape: 'H x W spectrum', kind: 'input' },
+        { title: 'Audio FFT', op: 'torch.fft.rfft(audio) -> flatness/mel energy', shape: '1-D spectrum', kind: 'input' },
+        { title: 'Segment Pooling', op: 'mean, top-k mean, peak, segment_inv', shape: 'window stats', kind: 'embedding' },
+        { title: 'Quality Gate', op: 'sharpness<q and audio<q -> gate=.20', shape: 'gate_frequency', kind: 'gate' },
+        { title: 'Frequency Head', op: 'Linear(d,24)->12->1 + sigmoid', shape: 'prob_fake_frequency', kind: 'output' },
+      ],
+      equations: ['magnitude=log(|FFT|+1)', 'segment_inv=1-(.75*topk+.25*peak)', 'gated_rel=prob*gate*reliability_term'],
+      featureGroups: ['visual_sharpness', 'audio_energy_mean/std', 'motion_mean', 'segment_topk_mean', 'segment_peak'],
+    },
+    scenegraph: {
+      family: 'Geometry/scene-structure service head',
+      code: 'face centers + area jitter + predict_service_head(method=scenegraph)',
+      tensor: 'object/face geometry statistics -> MLP',
+      layout: 'graph',
+      stages: [
+        { title: 'Node Extraction', op: 'face_box center, area, frame motion', shape: 'nodes over T', kind: 'input' },
+        { title: 'Edge Dynamics', op: 'center std + area std + motion_mean', shape: 'temporal graph stats', kind: 'encoder' },
+        { title: 'Scene Score', op: 'clamp(face_jitter*2.4 + area_jitter*3.2)', shape: 'structure cue', kind: 'embedding' },
+        { title: 'Structure Gate', op: 'face<.20 and motion<q -> gate=.20', shape: 'gate_scenegraph', kind: 'gate' },
+        { title: 'SceneGraph Head', op: 'ServiceHeadNet + OpenCLIP anchor', shape: 'prob_fake_scenegraph', kind: 'output' },
+      ],
+      equations: ['face_center=((x+w/2)/S,(y+h/2)/S)', 'face_jitter=std(cx)+std(cy)', 'scenegraph=clamp(jitter terms)'],
+      featureGroups: ['face_detect_ratio', 'mean_face_area', 'motion_mean', 'visual_sharpness', 'precheck/reliability'],
+    },
+  }
+  const architectureBlueprintRows = modelArchitectureRows.map((item) => {
+    const blueprint = architectureBlueprintMap[item.id]
+    const isSelected = item.id === selectedArchitectureId
+    const isFinalActive = analysis.inferenceMode === 'single' ? isSelected : item.weight > 0
+    return {
+      ...item,
+      blueprint,
+      isSelected,
+      isFinalActive,
+      outputLabel: item.tone === 'fake' ? `Fake ${formatPercent(item.fakePercent)}` : `Real ${formatPercent(item.realPercent)}`,
+      flowLabel: isSelected ? 'Selected' : isFinalActive ? 'Fusion active' : 'Computed / reference',
+    }
+  })
+  const selectedArchitectureRow = architectureBlueprintRows.find((item) => item.id === selectedArchitectureId) ?? architectureBlueprintRows[0]
+  const finalActiveRows = architectureBlueprintRows.filter((item) => item.isFinalActive)
+  type ModalityJudgment = NonNullable<Analysis['modalityJudgments']>[number]
+  const modelSignatures: Record<string, { glyph: string; tag: string; tone: string }> = {
+    OpenCLIP: { glyph: '🖼️', tag: 'image-text match', tone: 'cyan' },
+    FLAVA: { glyph: '🧩', tag: 'multi-signal fusion', tone: 'violet' },
+    'BLIP+NLI': { glyph: '📝', tag: 'caption logic', tone: 'rose' },
+    AVSync: { glyph: '👄', tag: 'lip-audio sync', tone: 'emerald' },
+    'Frequency Fusion': { glyph: '〰️', tag: 'frequency trace', tone: 'amber' },
+    'SceneGraph GCN': { glyph: '🕸️', tag: 'relation graph', tone: 'blue' },
+    'Proposed Fusion': { glyph: '🎯', tag: 'final decision', tone: 'silver' },
+  }
+  const getModelSignature = (label: string) => {
+    const normalized = label.replace(/\s+/g, '').toLowerCase()
+    return Object.entries(modelSignatures).find(([key]) => normalized.includes(key.replace(/\s+/g, '').toLowerCase()))?.[1]
+      ?? { glyph: '🔎', tag: 'model signal', tone: 'silver' }
+  }
+  const allModelVotes = analysis.modalityJudgments ?? []
+  const finalFusionVote = allModelVotes.find((item) => /proposed\s*fusion|final\s*fusion/i.test(item.label))
+  const displayModelVotes = allModelVotes.filter((item) => item !== finalFusionVote)
+  const realModelVotes = displayModelVotes.filter((item) => item.realPercent >= item.fakePercent)
+  const fakeModelVotes = displayModelVotes.filter((item) => item.fakePercent > item.realPercent)
+  const finalVote: ModalityJudgment = finalFusionVote ?? {
+    label: 'Final Fusion',
+    realPercent: analysis.realPercent,
+    fakePercent: analysis.fakePercent,
+    verdict: analysis.verdictLabel,
+    reason: analysis.summary,
+  }
+  const voteStrength = (item: ModalityJudgment) => Math.max(item.realPercent, item.fakePercent)
+  const laneAverage = (rows: ModalityJudgment[]) => rows.length
+    ? rows.reduce((total, item) => total + voteStrength(item), 0) / rows.length
+    : 0
+  const finalSide = finalVote.fakePercent > finalVote.realPercent ? 'fake' : 'real'
+  const renderModelVoteCard = (item: ModalityJudgment) => {
+    const side = item.fakePercent > item.realPercent ? 'fake' : 'real'
+    const signature = getModelSignature(item.label)
+    return (
+      <article key={item.label} className={`model-vote-card is-${side} tone-${signature.tone}`}>
+        <div className="model-vote-glyph" aria-hidden="true">{signature.glyph}</div>
+        <div className="model-vote-body">
+          <div className="model-vote-title">
+            <strong>{item.label}</strong>
+            <span>{signature.tag}</span>
+          </div>
+          <div className="model-vote-result">
+            <b>{side === 'fake' ? 'AI-Generated 쪽' : 'Real 쪽'}</b>
+            <em>{formatPercent(voteStrength(item))}</em>
+          </div>
+          <div className="model-vote-meter" aria-hidden="true"><i style={{ width: scoreWidth(voteStrength(item)) }} /></div>
+          <small>Real {formatPercent(item.realPercent)} · AI {formatPercent(item.fakePercent)}</small>
+          <p>{readableModelReason(item.reason)}</p>
+        </div>
+      </article>
+    )
+  }
+  const architectureReaderMap: Record<string, { question: string; watches: string; computes: string; contribution: string }> = {
+    openclip: {
+      question: '화면과 설명이 같은 의미인가?',
+      watches: '대표 프레임, 얼굴 ROI, real/fake prompt, 보조 텍스트를 봅니다.',
+      computes: '이미지와 텍스트를 같은 임베딩 공간에 올린 뒤 cosine similarity와 prompt softmax로 Fake score를 만듭니다.',
+      contribution: '다른 service head의 anchor로도 쓰이므로, 단순 1개 모델이 아니라 전체 파이프라인의 기준점 역할을 합니다.',
+    },
+    flava: {
+      question: '시각·언어·오디오 단서가 한 방향으로 모이는가?',
+      watches: 'OpenCLIP score, 구간 점수, 얼굴/입술 비율, 오디오 에너지, 움직임, 텍스트 길이를 함께 봅니다.',
+      computes: '정규화된 feature vector를 작은 MLP head에 통과시키고 OpenCLIP anchor와 섞어 score를 만듭니다.',
+      contribution: '최종 fusion에서 active weight가 있으면 종합 정합성 판단의 중심 단서로 반영됩니다.',
+    },
+    'blip-nli': {
+      question: '장면 설명과 텍스트가 서로 모순되는가?',
+      watches: '프레임 흐름, 화면 선명도, 텍스트 길이, OpenCLIP 기준 점수를 봅니다.',
+      computes: '텍스트가 충분할 때 scene-text consistency vector를 MLP로 계산하고, 텍스트가 짧으면 gate로 영향력을 낮춥니다.',
+      contribution: '자막/설명 입력이 있는 샘플에서 왜 장면-텍스트가 맞거나 어긋났는지 설명하는 보조 근거입니다.',
+    },
+    avsync: {
+      question: '입술 움직임과 음성 타이밍이 맞는가?',
+      watches: '얼굴 박스, 입술 박스, mouth_track_ratio, RMS audio envelope, lag correlation을 봅니다.',
+      computes: '입 움직임과 음성 에너지의 시간 상관을 -4~+4 frame lag에서 비교한 뒤 MLP head와 gate를 거칩니다.',
+      contribution: '딥페이크/더빙/합성 음성 의심에서 사용자가 가장 납득하기 쉬운 시간 정합성 근거입니다.',
+    },
+    frequency: {
+      question: '영상/음성에 생성형 잔여 패턴이 있는가?',
+      watches: '프레임 FFT, 오디오 FFT, sharpness, audio energy, segment mean/top-k/peak를 봅니다.',
+      computes: '주파수 magnitude와 구간 통계를 service head로 보내고 품질이 낮으면 gate로 과신을 줄입니다.',
+      contribution: '픽셀이나 음성 파형에서 눈으로 보기 어려운 포렌식 단서를 final fusion에 제공합니다.',
+    },
+    scenegraph: {
+      question: '얼굴·객체·장면 구조가 시간 흐름에서 안정적인가?',
+      watches: '얼굴 중심 좌표, 얼굴 면적, 움직임 평균, 장면 선명도, 구조 jitter를 봅니다.',
+      computes: 'face center/area 변화량을 구조 feature로 만들고 MLP head로 장면 안정성 score를 계산합니다.',
+      contribution: '현재 config에서 weight가 0이면 최종 평균에는 직접 들어가지 않지만, 구조 해석 카드에는 남겨 사용자가 확인할 수 있습니다.',
+    },
+  }
+  const architectureReaderRows = architectureBlueprintRows.map((item) => ({
+    ...item,
+    reader: architectureReaderMap[item.id],
+  }))
+  const architectureGlobalSteps = [
+    { label: '1. 샘플링', body: '원본 영상에서 대표 프레임, 얼굴/입술 ROI, 오디오 구간, 텍스트 입력을 추출합니다.' },
+    { label: '2. 단서 추출', body: '임베딩, FFT, 음성 에너지, 움직임, 얼굴 구조 같은 서로 다른 feature를 만듭니다.' },
+    { label: '3. 6개 score', body: 'OpenCLIP과 5개 service head가 각각 prob_fake 값을 출력합니다.' },
+    { label: '4. gate/reliability', body: '단서가 부족한 모델은 영향력을 낮춰 과신하지 않게 합니다.' },
+    { label: '5. 최종 판정', body: analysis.inferenceMode === 'single' ? '단독 모드에서는 선택 모델 score를 최종 결과로 사용합니다.' : '융합 모드에서는 active weight가 있는 모델 score를 weighted mean으로 합칩니다.' },
+  ]
+
+
+
   return (
     <section className="result-dashboard">
         <div className="result-summary">
           <div className="summary-copy"><span className="eyebrow">{category.kicker}</span><h2>{analysis.summary}</h2><p>{isMultimodal ? `${analysis.inferenceMode === 'single' ? '선택한 모델의 분석 결과만 사용해 최종 판정 값을 산출했습니다.' : '6개 모델 점수와 사전 탐지 결과를 종합해 최종 판정 값을 산출했습니다.'}` : category.id === 'image' ? 'RGB 장면 단서와 FFT 주파수 단서를 함께 읽고, 정밀 모델에서는 얼굴 중심 재판독까지 반영했습니다.' : isVideo ? '비디오 전용 7개 EfficientNet-B0 모델이 동일한 샘플 프레임을 보고, 모델 간 median과 프레임 confidence_mean으로 최종 확률을 계산했습니다.' : `${profile.title} / ${profile.badge} / ${profile.xai}`}</p><DeveloperOverrideNotice analysis={analysis} /></div>
         <article className="confidence-dial">
           <div className={`confidence-ring ${analysis.fakePercent >= analysis.realPercent ? 'is-fake' : 'is-real'}`} style={confidenceRingStyle(analysis)}>
-            <div className="confidence-core"><span>{analysis.verdictLabel}</span><strong>{formatPercent(Math.max(analysis.fakePercent, analysis.realPercent))}</strong><small>confidence {analysis.confidence}%</small></div>
+            <div className="confidence-core"><span>{analysis.verdictLabel}</span><strong>{formatPercent(Math.max(analysis.fakePercent, analysis.realPercent))}</strong><small>판정 신뢰도 {analysis.confidence}%</small></div>
           </div>
           <div className="confidence-legend">
             <div><span>Real</span><strong>{formatPercent(analysis.realPercent)}</strong><div className="confidence-mini-track"><i className="real" style={{ width: scoreWidth(analysis.realPercent) }}><span>{formatPercent(analysis.realPercent)}</span></i></div></div>
@@ -2527,6 +3288,7 @@ function ResultDashboard({ analysis, upload, category, profile, llmSectionStatus
         </article>
       </div>
 
+      <ResultReadingSummary category={category} analysis={analysis} />
       <XaiTrustNotice compact />
       <ResultInterpretationGuide category={category} analysis={analysis} />
 
@@ -2557,35 +3319,319 @@ function ResultDashboard({ analysis, upload, category, profile, llmSectionStatus
       ) : null}
 
       {category.id === 'multimodal' && analysis.modalityJudgments?.length ? (
-        <section className="result-signal-board">
-          <div className="panel-header"><div><span className="eyebrow">XAI ORCHESTRATION</span><h3>모달리티별 판단과 퓨징 로직</h3></div><span className="panel-chip">{analysis.xaiHeadline ?? 'Cross-modal board'}</span></div>
+        <section className="result-signal-board multimodal-command-center">
+          <div className="panel-header"><div><span className="eyebrow">MULTIMODAL XAI</span><h3>입력 단서와 모델 판단을 한눈에 보기</h3></div><span className="panel-chip">{analysis.xaiHeadline ?? 'Cross-modal board'}</span></div>
+          <div className="multimodal-overview-grid">
+            <article className="multimodal-overview-card">
+              <span>입력 단서 확보</span>
+              <strong>{multimodalActiveCount}/{multimodalInputs.length || 4}</strong>
+              <div className="multimodal-chip-row">{multimodalInputs.map((item) => <b key={item.label} className={item.active ? 'is-active' : ''}>{item.label}</b>)}</div>
+              <p>확보된 입력만 최종 판단에 크게 반영하고, 감지되지 않은 단서는 자동으로 영향력을 낮춥니다.</p>
+            </article>
+            <article className="multimodal-overview-card">
+              <span>판정 방향</span>
+              <strong>{analysis.fakePercent >= analysis.realPercent ? 'Fake 우세' : 'Real 우세'}</strong>
+              <div className="multimodal-split-meter"><i className="real" style={{ width: scoreWidth(analysis.realPercent) }} /><i className="fake" style={{ width: scoreWidth(analysis.fakePercent) }} /></div>
+              <p>Real {formatPercent(analysis.realPercent)} / Fake {formatPercent(analysis.fakePercent)}. 세부 모델은 Real {multimodalRealCount}개, Fake {multimodalFakeCount}개 방향으로 기울었습니다.</p>
+            </article>
+            <article className="multimodal-overview-card">
+              <span>가장 강한 단서</span>
+              <strong>{multimodalDominantJudgment?.label ?? '확인 중'}</strong>
+              <div className="judge-track"><i className={multimodalDominantJudgment && multimodalDominantJudgment.fakePercent >= multimodalDominantJudgment.realPercent ? 'fake' : 'real'} style={{ width: scoreWidth(multimodalDominantJudgment ? Math.max(multimodalDominantJudgment.fakePercent, multimodalDominantJudgment.realPercent) : 0) }}><span>{multimodalDominantJudgment ? formatPercent(Math.max(multimodalDominantJudgment.fakePercent, multimodalDominantJudgment.realPercent)) : '0%'}</span></i></div>
+              <p>{multimodalDominantJudgment?.reason ?? '가장 강하게 반영된 모달리티 신호를 표시합니다.'}</p>
+            </article>
+            <article className="multimodal-overview-card">
+              <span>우선 확인할 부분</span>
+              <strong>{multimodalRiskJudgment?.fakePercent && multimodalRiskJudgment.fakePercent > multimodalRiskJudgment.realPercent ? multimodalRiskJudgment.label : multimodalPeakSlice?.label ?? '타임라인'}</strong>
+              <small>{multimodalPeakSlice ? `${multimodalPeakSlice.start} - ${multimodalPeakSlice.end} / ${formatPercent(multimodalPeakSlice.score * 100)}` : multimodalFusionTop ? `${multimodalFusionTop.label} ${multimodalFusionTop.weight}%` : '근거 확인'}</small>
+              <p>{multimodalPeakSlice?.note ?? '의심 구간 또는 가장 큰 융합 가중치를 먼저 확인하면 결과를 빠르게 해석할 수 있습니다.'}</p>
+            </article>
+          </div>
+          <div className="multimodal-relation-board">
+            <div className="panel-header compact"><div><span className="eyebrow">RELATION EVIDENCE</span><h3>어떤 관계가 판단에 영향을 줬는가</h3><p>{relationScoreNote}</p></div><span className="panel-chip">{analysis.fakePercent >= analysis.realPercent ? 'Fake 쪽 근거 우세' : 'Real 쪽 근거 우세'}</span></div>
+            <div className="relation-evidence-grid">
+              {relationContributionRows.map((row) => (
+                <article key={row.title} className={`relation-evidence-card is-${row.tone}`}>
+                  <div><strong>{row.title}</strong><span>{row.verdict}</span></div>
+                  <div className="relation-score-line"><i style={{ width: scoreWidth(row.contribution) }} /><b>반영 비중 {formatPercent(row.contribution)}</b></div>
+                  <small className="relation-strength-label">관계 신호 {formatPercent(row.score)} · {relationStrengthText(row.score)}</small>
+                  <p>{row.body}</p>
+                </article>
+              ))}
+            </div>
+          </div>
+          <div className="multimodal-consistency-board">
+            <div className="panel-header compact"><div><span className="eyebrow">CONSISTENCY MAP</span><h3>정합성 지도: 맞는 관계와 어긋난 관계</h3><p>각 관계는 모델이 실제로 확보한 얼굴·입술·음성·텍스트·프레임·주파수 단서를 서로 비교한 결과입니다.</p></div><span className={`panel-chip ${topConsistencySignal?.tone === 'fake' ? 'is-fake' : 'is-real'}`}>{topConsistencySignal ? topConsistencySignal.title : '관계 분석'}</span></div>
+            <div className="consistency-summary-grid">
+              <article>
+                <span>잘 맞는 관계</span>
+                <strong>{relationMatches.length ? relationMatches[0].title : '확인된 강한 정합 없음'}</strong>
+                <p>{relationMatches.length ? relationMatches.slice(0, 2).map((item) => item.title).join(', ') : '현재 입력에서는 Real 방향의 관계 근거가 약하거나 제한적입니다.'}</p>
+              </article>
+              <article>
+                <span>어긋난 관계</span>
+                <strong>{relationMismatches.length ? relationMismatches[0].title : '뚜렷한 불일치 없음'}</strong>
+                <p>{relationMismatches.length ? relationMismatches.slice(0, 2).map((item) => item.title).join(', ') : 'Fake 방향으로 강하게 기운 관계가 뚜렷하지 않습니다.'}</p>
+              </article>
+              <article>
+                <span>해석이 제한된 관계</span>
+                <strong>{relationLimited.length ? relationLimited[0].title : '없음'}</strong>
+                <p>{relationLimited.length ? '해당 단서는 검출이 약해 최종 판단에서 낮은 비중으로 처리했습니다.' : '비교에 필요한 주요 단서가 대체로 확보되었습니다.'}</p>
+              </article>
+            </div>
+            <div className="consistency-map-grid">
+              {relationContributionRows.map((row) => (
+                <article key={`map-${row.title}`} className={`consistency-map-card is-${row.tone}`}>
+                  <div className="consistency-pair"><b>{row.title.split(' ↔ ')[0]}</b><i /><b>{row.title.split(' ↔ ')[1] ?? ''}</b></div>
+                  <strong>{row.verdict}</strong>
+                  <div className="relation-score-line"><i style={{ width: scoreWidth(row.contribution) }} /><b>{formatPercent(row.contribution)}</b></div>
+                </article>
+              ))}
+            </div>
+          </div>
+          <div className="multimodal-architecture-board">
+            <div className="panel-header compact"><div><span className="eyebrow">MODEL ARCHITECTURE FLOW</span><h3>6개 모델의 실제 연산 구조와 최종 융합</h3><p>백엔드 코드의 입력 feature, OpenCLIP embedding space, ServiceHeadNet layer, gate/reliability, final8000 weighted fusion을 논문 아키텍처 도식처럼 재구성했습니다. 각 카드를 펼치면 해당 모델의 stage가 애니메이션으로 흐릅니다.</p></div><span className="panel-chip">{analysis.inferenceMode === 'single' ? 'Single path' : '6-model fusion'}</span></div>
+            <div className={`architecture-paper-canvas ${analysis.inferenceMode === 'single' ? 'is-single' : 'is-ensemble'}`}>
+              <div className="architecture-paper-hero">
+                <div>
+                  <span className="paper-kicker">CODE-MIRRORED ARCHITECTURE</span>
+                  <strong>{analysis.inferenceMode === 'single' ? `${selectedArchitectureRow.model} 단독 추론 구조` : '원본 영상에서 최종 Real/Fake까지 흐르는 전체 구조'}</strong>
+                  <p>먼저 아래 전체 지도를 보고, 그 다음 궁금한 모델 카드를 펼쳐보면 됩니다. 각 카드는 “무엇을 보는지”, “어떻게 계산하는지”, “최종 결과에 어떻게 들어가는지”를 코드의 실제 변수와 layer 구조에 맞춰 설명합니다.</p>
+                </div>
+                <div className={`paper-final-chip ${analysis.fakePercent >= analysis.realPercent ? 'is-fake' : 'is-real'}`}>
+                  <span>{analysis.inferenceMode === 'single' ? 'Selected output' : 'Final output'}</span>
+                  <b>{analysis.fakePercent >= analysis.realPercent ? `Fake ${formatPercent(analysis.fakePercent)}` : `Real ${formatPercent(analysis.realPercent)}`}</b>
+                </div>
+              </div>
+
+              <div className="architecture-reader-guide">
+                <article>
+                  <span className="paper-kicker">HOW TO READ</span>
+                  <strong>사용자는 이 세 가지를 보면 됩니다</strong>
+                  <p><b>무엇을 봤는가</b>는 입력 단서, <b>어떻게 계산했는가</b>는 모델 stage, <b>얼마나 반영됐는가</b>는 fusion weight입니다. 최종 확률과 각 모델 score는 서로 다를 수 있습니다.</p>
+                </article>
+                <article>
+                  <span className="paper-kicker">현재 선택 경로</span>
+                  <strong>{selectedArchitectureRow.model}</strong>
+                  <p>{architectureReaderMap[selectedArchitectureId]?.question ?? '선택 모델의 판단 질문을 확인합니다.'} {analysis.inferenceMode === 'single' ? '단독 모드라 이 모델 score가 곧 최종 판정입니다.' : '융합 모드라 선택 모델은 대표 경로이고, 최종 결과는 active 모델들을 함께 봅니다.'}</p>
+                </article>
+              </div>
+
+              <div className="architecture-subway-map">
+                {architectureGlobalSteps.map((step, index) => (
+                  <div key={step.label} className="subway-step" style={{ ['--subway-index' as string]: index } as CSSProperties}>
+                    <span>{step.label}</span>
+                    <p>{step.body}</p>
+                  </div>
+                ))}
+              </div>
+
+              <div className="model-question-grid">
+                {architectureReaderRows.map((item) => (
+                  <article key={`question-${item.id}`} className={`model-question-card is-${item.tone} ${item.isSelected ? 'is-selected' : ''}`}>
+                    <span>{item.model}</span>
+                    <strong>{item.reader.question}</strong>
+                    <p>{item.reader.watches}</p>
+                    <small>{item.isFinalActive ? `최종 반영 weight ${analysis.inferenceMode === 'single' ? '1.00' : `${item.weight}%`}` : '계산됨 / 최종 평균 직접 반영 없음'}</small>
+                  </article>
+                ))}
+              </div>
+
+              <div className="paper-model-grid">
+                {architectureReaderRows.map((item, index) => (
+                  <details key={item.id} className={`paper-model-card is-${item.tone} ${item.isSelected ? 'is-selected' : ''} ${item.isFinalActive ? 'is-final-active' : 'is-reference'}`} open={item.isSelected}>
+                    <summary>
+                      <div>
+                        <span>{item.flowLabel}</span>
+                        <strong>{item.model}</strong>
+                        <small>{item.blueprint.family}</small>
+                      </div>
+                      <b>{item.outputLabel}</b>
+                    </summary>
+                    <div className={`paper-architecture-diagram is-${item.blueprint.layout}`} style={{ ['--diagram-index' as string]: index } as CSSProperties}>
+                      <div className="model-reader-notes">
+                        <div><span>무엇을 보나</span><p>{item.reader.watches}</p></div>
+                        <div><span>어떻게 계산하나</span><p>{item.reader.computes}</p></div>
+                        <div><span>결과에 어떻게 들어가나</span><p>{item.reader.contribution}</p></div>
+                      </div>
+                      <div className="paper-code-strip"><span>Code path</span><code>{item.blueprint.code}</code></div>
+                      <div className="tensor-ribbon">
+                        {item.blueprint.featureGroups.map((feature) => <span key={`${item.id}-${feature}`}>{feature}</span>)}
+                      </div>
+                      <div className="stage-scroll">
+                        {item.blueprint.stages.map((stage, stageIndex) => (
+                          <div key={`${item.id}-${stage.title}`} className={`paper-stage-node is-${stage.kind}`} style={{ ['--stage-index' as string]: stageIndex } as CSSProperties}>
+                            <i />
+                            <span>{stage.shape}</span>
+                            <strong>{stage.title}</strong>
+                            <code>{stage.op}</code>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="architecture-equation-row">
+                        {item.blueprint.equations.map((equation) => <code key={`${item.id}-${equation}`}>{equation}</code>)}
+                      </div>
+                      {item.blueprint.layout === 'contrastive' ? (
+                        <div className="embedding-space-panel">
+                          <div className="embedding-axis image-axis">image embeddings</div>
+                          <div className="embedding-axis text-axis">text embeddings</div>
+                          <span className="embedding-dot image-a" />
+                          <span className="embedding-dot image-b" />
+                          <span className="embedding-dot text-a" />
+                          <span className="embedding-dot text-b" />
+                          <i className="contrastive-link link-a" />
+                          <i className="contrastive-link link-b" />
+                          <strong>shared embedding space</strong>
+                          <small>normalized dot product / cosine similarity</small>
+                        </div>
+                      ) : (
+                        <div className="mlp-layer-panel">
+                          <div className="mlp-column"><span /><span /><span /><span /></div>
+                          <b>z-score</b>
+                          <div className="mlp-column mid"><span /><span /><span /></div>
+                          <b>Linear 24</b>
+                          <div className="mlp-column small"><span /><span /></div>
+                          <b>Linear 12</b>
+                          <div className="mlp-output-node">sigmoid</div>
+                        </div>
+                      )}
+                    </div>
+                  </details>
+                ))}
+              </div>
+
+              <div className={`paper-fusion-canvas ${analysis.fakePercent >= analysis.realPercent ? 'is-fake' : 'is-real'}`}>
+                <div className="fusion-matrix">
+                  {architectureBlueprintRows.map((item, index) => (
+                    <div key={`matrix-${item.id}`} className={`fusion-matrix-row ${item.isFinalActive ? 'is-active' : 'is-zero'} is-${item.tone}`} style={{ ['--matrix-index' as string]: index } as CSSProperties}>
+                      <span>{item.model}</span>
+                      <i style={{ width: scoreWidth(item.signal) }} />
+                      <b>{analysis.inferenceMode === 'single' ? (item.isSelected ? '1.00' : '0.00') : (item.weight / 100).toFixed(2)}</b>
+                    </div>
+                  ))}
+                </div>
+                <div className="fusion-formula-panel">
+                  <span className="paper-kicker">FUSION METHOD</span>
+                  <strong>{analysis.inferenceMode === 'single' ? 'single selected score' : 'calibrated weighted mean / runtime fallback'}</strong>
+                  <p>{analysis.inferenceMode === 'single' ? '단독 모드에서는 선택한 모델의 prob_fake 값을 최종 확률로 사용합니다. 그래서 다른 모델 카드가 Fake/Real을 다르게 보더라도 최종 판정에는 들어가지 않습니다.' : `현재 final8000 설정에서 최종 평균에 직접 들어가는 active 모델은 ${finalActiveRows.map((item) => item.model).join(', ')}입니다. 나머지 모델도 계산되어 XAI에는 표시되지만, weight가 0이면 최종 weighted mean에는 직접 더해지지 않습니다.`}</p>
+                  <div className="fusion-equation">
+                    <code>{analysis.inferenceMode === 'single' ? 'fake_score = model_scores[selected_key]' : 'fake_score = sum(w_i * prob_fake_i) / sum(w_i)'}</code>
+                    <code>confidence = clamp(66 + |fake_score-.5| * 78)</code>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div className="multimodal-signal-lab">
+            <article className="multimodal-signal-checklist">
+              <div className="panel-header compact"><div><span className="eyebrow">INPUT CHECKLIST</span><h3>영상에서 실제로 사용한 정보</h3></div></div>
+              <div className="signal-check-grid">
+                {multimodalSignalChecklist.map((item) => (
+                  <div key={item.label} className={`signal-check-card ${item.active ? 'is-active' : 'is-muted'}`}>
+                    <span className="signal-emoji">{item.icon}</span>
+                    <strong>{item.label}</strong>
+                    <small>{item.active ? item.detail : '미검출 또는 낮은 신뢰도'}</small>
+                  </div>
+                ))}
+              </div>
+            </article>
+            <article className="multimodal-media-evidence-card">
+              <div className="panel-header compact"><div><span className="eyebrow">SOURCE OVERLAY</span><h3>전체 영상 위에 얹은 감지 단서</h3></div><span className="panel-chip">Playable overlay</span></div>
+              <SourceOverlayStage analysis={analysis} upload={upload} frameRows={multimodalFrameUseRows} />
+              <p className="panel-caption">이 섹션의 인물·얼굴·입술 박스는 백엔드가 샘플 프레임에서 실제로 검출한 좌표를 영상 재생 시간에 맞춰 표시합니다. 음성은 에너지 리본으로 표시하며, 자막/텍스트 단서는 후보 박스로 표시하지 않고 전체 정합성 판단의 보조 메타데이터로만 사용합니다. YouTube처럼 브라우저가 원본 파일을 직접 재생할 수 없는 URL은 대표 프레임으로 대체됩니다. 이는 AI의 직접 증거가 아니라 모델 입력·사전 탐지·구간 점수를 함께 읽기 위한 보조 해석입니다.</p>
+            </article>
+          </div>
+          {multimodalFrameUseRows.length ? (
+            <div className="multimodal-frame-usage">
+              <div className="panel-header compact"><div><span className="eyebrow">FRAME USAGE</span><h3>어느 구간을 주로 봤는가</h3></div><span className="panel-chip">{analysis.processingScope?.sampleFrames ?? analysis.timeline.length} samples</span></div>
+              <div className="frame-usage-grid">
+                {multimodalFrameUseRows.map((row) => (
+                  <article key={`${row.label}-${row.range}`} className="frame-usage-card">
+                    <div><strong>{row.label}</strong><span>{row.range}</span></div>
+                    <div className="timeline-bar"><div className={`timeline-bar-fill ${row.score >= 50 ? 'is-fake' : 'is-real'}`} style={{ width: scoreWidth(row.score) }}><span>{formatPercent(row.score)}</span></div></div>
+                    <b>{row.verdict}</b>
+                    <p>{row.note}</p>
+                  </article>
+                ))}
+              </div>
+            </div>
+          ) : null}
+          <div className="multimodal-flow-rail">
+            {(analysis.fusionWeights ?? []).slice(0, 6).map((item, index) => (
+              <div key={item.label} className="multimodal-flow-step">
+                <span>{String(index + 1).padStart(2, '0')}</span>
+                <strong>{item.label}</strong>
+                <i style={{ width: `${Math.max(12, item.weight)}%` }} />
+                <small>{item.weight}% 반영</small>
+              </div>
+            ))}
+          </div>
           {analysis.availability ? (
             <div className="modality-judge-grid">
               {[
-                { label: 'Face', active: analysis.availability.hasFace, detail: `${Math.round(analysis.availability.faceRatio * 100)}% visible` },
-                { label: 'Lips', active: analysis.availability.hasLips, detail: `${Math.round(analysis.availability.mouthRatio * 100)}% trackable` },
-                { label: 'Speech', active: analysis.availability.hasSpeech, detail: `${Math.round(analysis.availability.speechConfidence * 100)}% confidence` },
-                { label: 'Text', active: analysis.availability.hasText, detail: `${Math.round(analysis.availability.textConfidence * 100)}% confidence` },
+                { label: '얼굴', active: analysis.availability.hasFace, detail: `${Math.round(analysis.availability.faceRatio * 100)}% 프레임에서 얼굴 확인` },
+                { label: '입술', active: analysis.availability.hasLips, detail: `${Math.round(analysis.availability.mouthRatio * 100)}% 프레임에서 입술 추적` },
+                { label: '음성', active: analysis.availability.hasSpeech, detail: `${Math.round(analysis.availability.speechConfidence * 100)}% 수준의 음성 단서` },
+                { label: '텍스트', active: analysis.availability.hasText, detail: `${Math.round(analysis.availability.textConfidence * 100)}% 수준의 자막/문장 단서` },
               ].map((item) => (
                 <article key={item.label} className="modality-judge-card">
-                  <div className="modality-head"><strong>{item.label} pre-check</strong><span>{item.active ? 'active' : 'gated down'}</span></div>
+                  <div className="modality-head"><strong>{item.label} 사전 확인</strong><span>{item.active ? '분석에 사용' : '낮은 비중'}</span></div>
                   <div className="modality-score-pair"><b>{item.detail}</b></div>
                   <div className="judge-track"><i style={{ width: scoreWidth(item.active ? 88 : 18) }}><span>{item.active ? '88%' : '18%'}</span></i></div>
-                  <p>모델 추론 전에 실제로 존재하는 단서인지 먼저 판단해 융합 비중을 조정했습니다.</p>
+                  <p>모델 추론 전에 이 단서가 실제로 충분히 보이는지 확인하고, 부족한 단서는 최종 판단에서 낮은 비중으로 처리했습니다.</p>
                 </article>
               ))}
             </div>
           ) : null}
-          <div className="modality-judge-grid">
-            {analysis.modalityJudgments.map((item) => (
-              <article key={item.label} className="modality-judge-card">
-                <div className="modality-head"><strong>{item.label}</strong><span>{item.verdict}</span></div>
-                <div className="modality-score-pair"><b>Real {item.realPercent}%</b><b>Fake {item.fakePercent}%</b></div>
-                <div className="judge-track"><i className={item.fakePercent >= item.realPercent ? 'fake' : 'real'} style={{ width: scoreWidth(Math.max(item.fakePercent, item.realPercent)) }}><span>{item.fakePercent >= item.realPercent ? `Fake ${item.fakePercent}%` : `Real ${item.realPercent}%`}</span></i></div>
-                <p>{item.reason}</p>
-              </article>
-            ))}
-          </div>
+          {allModelVotes.length ? (
+            <div className="modality-vs-board">
+              <div className="modality-vs-header">
+                <div>
+                  <span className="eyebrow">MODEL VOTE BOARD</span>
+                  <h3>각 모델은 어느 쪽을 더 지지했는가</h3>
+                </div>
+                <p>개별 모델 점수를 Real 진영과 AI-Generated 진영으로 나눠 보여줍니다. 아래 최종 판단은 융합 모델이 이 의견들을 종합한 결과입니다.</p>
+              </div>
+              <div className="modality-vs-columns">
+                <section className="modality-vs-lane is-real">
+                  <div className="vs-lane-head">
+                    <span>Real</span>
+                    <strong>{realModelVotes.length} models</strong>
+                    <b>{realModelVotes.length ? formatPercent(laneAverage(realModelVotes)) : '0.0%'}</b>
+                  </div>
+                  <div className="model-vote-stack">
+                    {realModelVotes.length ? realModelVotes.map(renderModelVoteCard) : <div className="empty-vote-card">Real 쪽으로 기운 개별 모델이 없습니다.</div>}
+                  </div>
+                </section>
+                <div className="modality-vs-divider" aria-hidden="true">
+                  <span>VS</span>
+                  <i />
+                </div>
+                <section className="modality-vs-lane is-fake">
+                  <div className="vs-lane-head">
+                    <span>AI-Generated</span>
+                    <strong>{fakeModelVotes.length} models</strong>
+                    <b>{fakeModelVotes.length ? formatPercent(laneAverage(fakeModelVotes)) : '0.0%'}</b>
+                  </div>
+                  <div className="model-vote-stack">
+                    {fakeModelVotes.length ? fakeModelVotes.map(renderModelVoteCard) : <div className="empty-vote-card">AI-Generated 쪽으로 기운 개별 모델이 없습니다.</div>}
+                  </div>
+                </section>
+              </div>
+              <div className={`modality-final-verdict is-${finalSide}`}>
+                <div className="final-verdict-glyph" aria-hidden="true">{getModelSignature(finalVote.label).glyph}</div>
+                <div>
+                  <span>최종 융합 판단</span>
+                  <strong>{finalSide === 'fake' ? 'AI-Generated 우세' : 'Real 우세'}</strong>
+                  <p>{readableModelReason(finalVote.reason)}</p>
+                </div>
+                <div className="final-verdict-score">
+                  <b>{finalSide === 'fake' ? formatPercent(finalVote.fakePercent) : formatPercent(finalVote.realPercent)}</b>
+                  <small>Real {formatPercent(finalVote.realPercent)} · AI {formatPercent(finalVote.fakePercent)}</small>
+                </div>
+              </div>
+            </div>
+          ) : null}
           <div className="signal-board-grid">
             <ModelSignalPanel analysis={analysis} />
             <article className="signal-board-panel">
@@ -2646,7 +3692,7 @@ function ResultDashboard({ analysis, upload, category, profile, llmSectionStatus
             <div className="reasoning-list">
               <div className="reasoning-card"><strong>최종 결과</strong><p>{analysis.verdictLabel} 기준으로 Real {formatPercent(analysis.realPercent)}, Fake {formatPercent(analysis.fakePercent)}가 계산됐습니다.</p></div>
               <div className="reasoning-card"><strong>{category.id === 'image' ? '사용된 단서' : isVideo ? '사용된 모델 입력' : '사용된 모달'}</strong><p>{category.id === 'image' ? `얼굴=${String(analysis.availability?.hasFace ?? false)}, 텍스트=${String(analysis.availability?.hasText ?? false)}를 먼저 확인한 뒤 RGB와 FFT 분기 비중을 조정했습니다.` : isVideo ? '비디오 전용 모델은 오디오, 입술, 텍스트를 직접 입력으로 사용하지 않고, 균등 샘플 프레임과 text mask 전처리만 사용했습니다.' : `얼굴=${String(analysis.availability?.hasFace ?? false)}, 입술=${String(analysis.availability?.hasLips ?? false)}, 음성=${String(analysis.availability?.hasSpeech ?? false)}, 텍스트=${String(analysis.availability?.hasText ?? false)}를 먼저 확인한 뒤 반영 비중을 조정했습니다.`}</p></div>
-              <div className="reasoning-card"><strong>{isVideo ? '사용하지 않은 분기' : '게이트 다운된 분기'}</strong><p>{analysis.gatedBranches?.length ? `${analysis.gatedBranches.join(', ')} 단서는 현재 비디오 전용 모델의 직접 입력이 아니므로 최종 확률 계산에 사용하지 않았습니다.` : '모든 주요 단서가 확보되어 별도의 gate down 없이 융합에 반영했습니다.'}</p></div>
+              <div className="reasoning-card"><strong>{isVideo ? '사용하지 않은 분기' : '낮은 비중으로 처리한 단서'}</strong><p>{analysis.gatedBranches?.length ? `${analysis.gatedBranches.join(', ')} 단서는 현재 비디오 전용 모델의 직접 입력이 아니므로 최종 확률 계산에 사용하지 않았습니다.` : '모든 주요 단서가 충분히 확보되어 별도의 낮은 비중 처리 없이 융합에 반영했습니다.'}</p></div>
             </div>
           ) : (
             <div className="reasoning-list">{analysis.reasons.map((reason) => <div key={reason.title} className="reasoning-card"><strong>{reason.title}</strong><p>{reason.body}</p></div>)}</div>
@@ -2742,6 +3788,7 @@ function StudioPage({ category, onBack }: { category: CategoryConfig; onBack: ()
   const [developerMode, setDeveloperMode] = useState(false)
   const timerRef = useRef<number | null>(null)
   const analyzeClickTimerRef = useRef<number | null>(null)
+  const progressRailRef = useRef<HTMLDivElement | null>(null)
 
   useEffect(() => {
     setActiveProfileId(getDefaultProfile(category).id)
@@ -2813,6 +3860,9 @@ function StudioPage({ category, onBack }: { category: CategoryConfig; onBack: ()
     })
     setIsAnalyzing(true)
     setProgress(6)
+    window.requestAnimationFrame(() => {
+      progressRailRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    })
     const initialProgressCopy = progressCopyFor(category, 6)
     setProgressLabel(initialProgressCopy.label)
     setProgressDetail(initialProgressCopy.detail)
@@ -2969,17 +4019,21 @@ function StudioPage({ category, onBack }: { category: CategoryConfig; onBack: ()
 
       <section className={`studio-workbench ${analysis ? 'has-result' : 'is-input-only'}`}>
         <section className="studio-center-panel">
-          <UploadZone category={category} upload={upload} onUploadState={setUpload} />
+          <UploadZone category={category} upload={upload} onUploadState={setUpload} onAnalyze={() => { void handleAnalyze() }} canAnalyze={canAnalyze} isAnalyzing={isAnalyzing} />
           <section className="studio-status-strip"><article className="studio-status-card"><span>선택 모델</span><strong>{activeProfile.title}</strong><small>{activeProfile.subtitle}</small></article><article className="studio-status-card"><span>입력 상태</span><strong>{upload.file ? upload.file.name : upload.sourceMode === 'url' && upload.sourceUrl.trim() ? 'URL 입력 완료' : category.uploadKind === 'text' && upload.textValue ? '텍스트 입력 완료' : '입력을 기다리는 중'}</strong><small>{category.uploadKind === 'text' ? '텍스트 / 근거 / 설명' : (category.uploadKind === 'video' || category.id === 'image') ? '파일 또는 URL로 분석할 수 있습니다.' : '파일을 드래그하거나 직접 선택하세요'}</small></article><article className="studio-status-card"><span>분석 상태</span><strong>{isAnalyzing ? '분석 진행 중' : analysis ? '결과 준비 완료' : '대기 중'}</strong><small>{Math.round(progress)}% 진행</small></article>{category.id === 'multimodal' ? <article className="studio-status-card"><span>판정 모드</span><strong>{inferenceMode === 'ensemble' ? '6개 융합 판정' : '선택 모델 단독'}</strong><small>{inferenceMode === 'ensemble' ? '최종 결과는 6개 모델을 함께 씁니다.' : '현재 선택한 모델만 최종 판정에 사용합니다.'}</small></article> : null}</section>
-          {(isAnalyzing || analysis) ? <ProgressRail stages={category.stageLabels} progress={progress} isLive={isAnalyzing || llmSectionStatus === 'loading'} statusLabel={progressLabel} statusDetail={progressDetail} /> : null}
+          {(isAnalyzing || analysis) ? (
+            <div ref={progressRailRef} className="progress-rail-anchor">
+              <ProgressRail stages={category.stageLabels} progress={progress} isLive={isAnalyzing || llmSectionStatus === 'loading'} statusLabel={progressLabel} statusDetail={progressDetail} category={category} upload={upload} />
+            </div>
+          ) : null}
         </section>
 
         <aside className="studio-side-panel">
           <aside className="control-panel">
             <div className="panel-header"><div><span className="eyebrow">설정</span><h3>모델 설정</h3></div></div>
-            {category.id === 'image' ? <div className="control-block"><label>Vision focus</label><div className="segmented"><button type="button" className={imageScope === 'full-scene' ? 'is-active' : ''} onClick={() => setImageScope('full-scene')}>전체 장면 모델</button><button type="button" className={imageScope === 'face-focus' ? 'is-active' : ''} onClick={() => setImageScope('face-focus')}>얼굴 전용 모델</button></div><p className="control-hint">{imageScope === 'face-focus' ? '얼굴 전용 초점은 류지호 모델을 사용합니다. 얼굴이 없으면 장면 기준 모델로 자동 fallback 됩니다.' : '전체 장면 초점은 이원석 모델을 기준으로 판별하고, 얼굴이 있을 때 얼굴 재판독을 추가 반영합니다.'}</p></div> : null}
+            {category.id === 'image' ? <div className="control-block"><label>Vision focus</label><div className="segmented"><button type="button" className={imageScope === 'full-scene' ? 'is-active' : ''} onClick={() => setImageScope('full-scene')}>전체 장면 모델</button><button type="button" className={imageScope === 'face-focus' ? 'is-active' : ''} onClick={() => setImageScope('face-focus')}>얼굴 단서 반영</button></div><p className="control-hint">{imageScope === 'face-focus' ? '얼굴 단서는 판정에 참고하되, 결과 화면의 대표 이미지는 전체 원본 이미지를 유지합니다.' : '전체 장면 초점은 이원석 모델을 기준으로 판별하고, 얼굴이 있을 때 얼굴 재판독을 추가 반영합니다.'}</p></div> : null}
             {category.id === 'multimodal' ? <div className="control-block"><label>판정 방식</label><div className="segmented"><button type="button" className={inferenceMode === 'ensemble' ? 'is-active' : ''} onClick={() => setInferenceMode('ensemble')}>6개 융합 판정</button><button type="button" className={inferenceMode === 'single' ? 'is-active' : ''} onClick={() => setInferenceMode('single')}>선택 모델 단독</button></div><p className="control-hint">{inferenceMode === 'ensemble' ? '현재 선택한 모델은 대표 기준으로 사용되고, 최종 결과는 6개 모델을 모두 반영해 계산됩니다.' : '현재 선택한 모델 1개만 사용해 판정하며, 다른 5개 모델은 참고 카드로만 표시됩니다.'}</p></div> : null}
-            {category.id === 'image' ? <div className="control-block"><label>이미지 분석 방식</label><div className="segmented"><button type="button" className={activeProfile.id === 'image-fast' ? 'is-active' : ''} onClick={() => setActiveProfileId('image-fast')}>빠른 버전</button><button type="button" className={activeProfile.id === 'image-precision' ? 'is-active' : ''} onClick={() => setActiveProfileId('image-precision')}>정밀 버전</button></div><p className="control-hint">{activeProfile.id === 'image-precision' ? '정밀 버전은 이원석 모델을 주 경로로 사용합니다. 얼굴 전용 초점을 켜면 류지호 모델이 얼굴 crop을 전담합니다.' : '빠른 버전은 장면 전체 단서를 빠르게 훑고, 얼굴 전용 초점이 켜지면 류지호 모델을 함께 참조합니다.'}</p></div> : null}
+            {category.id === 'image' ? <div className="control-block"><label>이미지 분석 방식</label><div className="segmented"><button type="button" className={activeProfile.id === 'image-fast' ? 'is-active' : ''} onClick={() => setActiveProfileId('image-fast')}>빠른 버전</button><button type="button" className={activeProfile.id === 'image-precision' ? 'is-active' : ''} onClick={() => setActiveProfileId('image-precision')}>정밀 버전</button></div><p className="control-hint">{activeProfile.id === 'image-precision' ? '정밀 버전은 전체 이미지의 RGB와 주파수 단서를 주 경로로 사용하고, 얼굴 단서는 보조 근거로만 반영합니다.' : '빠른 버전은 장면 전체 단서를 빠르게 훑고, 얼굴 단서가 있으면 보조적으로 함께 참조합니다.'}</p></div> : null}
             {category.id === 'multimodal' ? <div className="control-block"><label>XAI 깊이</label><div className="segmented"><button type="button" className={xaiDepth === 'signature' ? 'is-active' : ''} onClick={() => setXaiDepth('signature')}>기본</button><button type="button" className={xaiDepth === 'deep-dive' ? 'is-active' : ''} onClick={() => setXaiDepth('deep-dive')}>상세</button></div></div> : null}
             {category.id === 'text' || category.id === 'multimodal' ? <div className="control-block"><label>{category.id === 'text' ? '입력 텍스트' : '보조 설명'}</label><textarea className="side-textarea" placeholder={category.id === 'text' ? '분석할 텍스트를 붙여넣거나 TXT 파일을 업로드하세요.' : '선택 사항: 캡션, 설명, 기사 문장 등을 함께 입력하세요.'} value={category.id === 'text' ? upload.textValue : companionText} onChange={(event) => category.id === 'text' ? setUpload((current) => ({ ...current, textValue: event.target.value })) : setCompanionText(event.target.value)} /></div> : null}
             <div className="control-list">{activeProfile.capabilities.map((capability) => <div key={capability} className="control-capability"><span className="highlight-dot" /><strong>{capability}</strong></div>)}</div>

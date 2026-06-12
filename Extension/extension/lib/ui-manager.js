@@ -7,8 +7,8 @@
   if (!window.ISY) return;
 
   const activeOverlays = new WeakMap();
-  // 0.4~0.6 구간은 모델 신뢰도가 낮은 "애매" 영역으로 별도 표기.
-  const HIGH_THRESHOLD = 0.6;
+  // 0.4~0.7 구간은 모델 신뢰도가 낮은 "애매" 영역으로 별도 표기.
+  const HIGH_THRESHOLD = 0.7;
   const LOW_THRESHOLD = 0.4;
 
   const MEDIA_TYPE_LABELS = { image: '이미지', video: '영상', text: '텍스트' };
@@ -196,6 +196,7 @@
       showDetailOverlay(targetElement, result, itemKey);
     }
     addClickAndKeydown(badge, open);
+    badge.addEventListener('mouseover', e => e.stopPropagation());
 
     const ok = window.ISY.badges.attach(targetElement, badge);
     if (!ok) delete targetElement.dataset.isyBadged;
@@ -293,7 +294,7 @@
               <div class="isy-gauge-threshold-high" aria-hidden="true"></div>
             </div>
             <div class="isy-gauge-scale" aria-hidden="true">
-              <span>0%</span><span>40%</span><span>60%</span><span>100%</span>
+              <span>0%</span><span>40%</span><span>70%</span><span>100%</span>
             </div>
           </div>
           ${renderDebugDetails(result, adapterName)}
@@ -301,7 +302,7 @@
       `;
     }
 
-    overlay.style.position = 'fixed';
+    overlay.style.position = 'absolute';
     overlay.style.top = '-9999px';
     overlay.style.left = '-9999px';
     overlay.style.zIndex = String(window.ISY.CONSTANTS.OVERLAY_Z_INDEX);
@@ -350,12 +351,15 @@
     const cardH = cardRect.height;
     const rect = targetElement.getBoundingClientRect();
     const margin = 12;
+    const scrollX = window.scrollX || window.pageXOffset;
+    const scrollY = window.scrollY || window.pageYOffset;
 
     if (window.innerWidth <= 520) {
-      overlay.style.left = '12px';
-      overlay.style.right = '12px';
-      overlay.style.bottom = '12px';
-      overlay.style.top = 'auto';
+      overlay.style.left = `${scrollX + 12}px`;
+      overlay.style.width = `${window.innerWidth - 24}px`;
+      overlay.style.top = `${scrollY + window.innerHeight - cardH - 12}px`;
+      overlay.style.bottom = 'auto';
+      overlay.style.right = 'auto';
       return;
     }
 
@@ -373,8 +377,8 @@
     }
     if (top < margin) top = margin;
 
-    overlay.style.top = `${top}px`;
-    overlay.style.left = `${left}px`;
+    overlay.style.top = `${top + scrollY}px`;
+    overlay.style.left = `${left + scrollX}px`;
   }
 
   function highlightElement(element) {

@@ -15,9 +15,9 @@ export default defineConfig({
         rewrite: (path) => path.replace(/^\/multimodal-api/, ''),
       },
       '/multimodal-api': {
-        target: 'http://127.0.0.1:8787',
+        target: 'http://127.0.0.1:8001',
         changeOrigin: true,
-        rewrite: (path) => path.replace(/^\/multimodal-api/, '/api'),
+        rewrite: (path) => path.replace(/^\/multimodal-api/, ''),
       },
     },
   },

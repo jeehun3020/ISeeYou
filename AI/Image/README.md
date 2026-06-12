@@ -34,3 +34,9 @@ Image/
 - 이미지 전용 inference 파일 분리.
 - 모델별 설정 파일 분리.
 - 실제 Grad-CAM 계산 여부와 설명 라벨 정교화.
+
+## 현재 연결된 최신 모델
+- 현재 웹 이미지 분석의 빠른/정밀/얼굴 초점 경로는 모두 `models/image_model_bundle/versionv12/weights/best.pt`를 사용합니다.
+- versionv12는 RGB 특징, FFT 주파수 특징, OpenCLIP ViT-B/32 시각 feature를 결합하는 Triple Fusion 구조입니다.
+- OpenCLIP ViT-B/32 가중치는 오프라인 실행을 위해 `models/image_model_bundle/versionv12/open_clip/timm_vit_base_patch32_clip_224.openai/open_clip_pytorch_model.bin`에 로컬 고정했습니다.
+- 이전 `best_dualstream_final.pt`, `0501_데모버전/weights/best.pt` 계열은 보관용/legacy 후보이며 현재 웹 이미지 판정의 주 경로가 아닙니다.

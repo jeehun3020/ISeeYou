@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import base64
 import cgi
@@ -29,6 +29,10 @@ os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 import cv2
 import imageio_ffmpeg
+try:
+    import mediapipe as mp
+except Exception:  # noqa: BLE001
+    mp = None
 import numpy as np
 import open_clip
 import pandas as pd
@@ -51,6 +55,7 @@ FRAME_SIZE = 224
 SAMPLE_FRAMES = 12
 AUDIO_SR = 16000
 MAX_SECONDS = 8.0
+REPRESENTATIVE_FRAME_SECONDS = 5.0
 SAMPLING_WINDOWS = 3
 OPENAI_MODEL = os.environ.get("OPENAI_API_MODEL", "gpt-5.5")
 RUNTIME_SOURCE_DIR = Path(r"D:\ISeeYou\experiments\final5000_gpu_anchor_fusion_v4b\full_model")
@@ -136,6 +141,42 @@ FACE_CASCADES = [
     cv2.CascadeClassifier(str(HAAR_ROOT / "haarcascade_profileface.xml")),
 ]
 SMILE_CASCADE = cv2.CascadeClassifier(str(HAAR_ROOT / "haarcascade_smile.xml"))
+MEDIAPIPE_FACE_MESH_LOCK = threading.Lock()
+MEDIAPIPE_FACE_MESH_STATE: dict[str, Any] = {}
+MEDIAPIPE_POSE_LOCK = threading.Lock()
+MEDIAPIPE_POSE_STATE: dict[str, Any] = {}
+MEDIAPIPE_SELFIE_LOCK = threading.Lock()
+MEDIAPIPE_SELFIE_STATE: dict[str, Any] = {}
+POSE_BODY_LANDMARK_IDS = [0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]
+LIP_LANDMARK_IDS = [
+    0, 13, 14, 17, 37, 39, 40, 61, 78, 80, 81, 82, 84, 87, 88, 91, 95,
+    146, 178, 181, 185, 191, 267, 269, 270, 291, 308, 310, 311, 312,
+    314, 317, 318, 321, 324, 375, 402, 405, 409, 415,
+]
+SEGMENTATION_FEATURE_COLUMNS = [
+    "person_mask_mean",
+    "person_mask_std",
+    "person_mask_peak",
+    "person_mask_topk_mean",
+    "person_mask_center_x_mean",
+    "person_mask_center_y_mean",
+    "person_mask_center_jitter",
+    "person_mask_coverage_ratio",
+    "face_box_ratio",
+    "face_area_mean",
+    "face_area_std",
+    "face_center_jitter",
+    "mouth_box_ratio",
+    "mouth_area_mean",
+    "mouth_motion_mean",
+    "mouth_motion_std",
+    "foreground_motion_mean",
+    "background_motion_mean",
+    "fg_bg_motion_ratio",
+    "segmentation_quality",
+]
+INNER_LIP_VERTICAL_PAIRS = [(13, 14), (82, 87), (312, 317)]
+OUTER_LIP_HORIZONTAL_PAIR = (61, 291)
 MODEL_LOCK = threading.Lock()
 MODEL_STATE: dict[str, Any] = {}
 IMAGE_MODEL_LOCK = threading.Lock()
@@ -154,6 +195,11 @@ def _first_existing_checkpoint(filename: str) -> Path:
 
 IMAGE_MODEL_CKPT = _first_existing_checkpoint("best_dualstream_final.pt")
 IMAGE_FACE_MODEL_CKPT = _first_existing_checkpoint("best.pt")
+IMAGE_V12_MODEL_DIR = IMAGE_MODEL_BUNDLE_DIR / "versionv12"
+IMAGE_V12_MODEL_CKPT = IMAGE_V12_MODEL_DIR / "weights" / "best.pt"
+IMAGE_V12_OPENCLIP_WEIGHT_PATH = IMAGE_V12_MODEL_DIR / "open_clip" / "timm_vit_base_patch32_clip_224.openai" / "open_clip_pytorch_model.bin"
+IMAGE_V12_MODEL_STATE: dict[str, Any] = {}
+IMAGE_V12_MODEL_LOCK = threading.Lock()
 
 
 class FFTBranch(nn.Module):
@@ -251,6 +297,34 @@ class LateFusionFaceModel(nn.Module):
         return self.fc(feat_cat)
 
 
+class TripleFusionImageV12Model(nn.Module):
+    def __init__(self, clip_feat_dim: int = 512):
+        super().__init__()
+        self.rgb_branch = timm.create_model("efficientnet_b4", pretrained=False, num_classes=0)
+        self.fft_branch = timm.create_model("efficientnet_b4", pretrained=False, num_classes=0)
+        self.clip_proj = nn.Sequential(
+            nn.Linear(clip_feat_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+        )
+        feat_dim = self.rgb_branch.num_features
+        self.fusion_head = nn.Sequential(
+            nn.Linear(feat_dim + feat_dim + 512, 512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, 2),
+        )
+
+    def forward(self, x_rgb: torch.Tensor, x_fft: torch.Tensor, x_clip: torch.Tensor) -> torch.Tensor:
+        rgb_feat = self.rgb_branch(x_rgb)
+        fft_feat = self.fft_branch(x_fft)
+        clip_feat = self.clip_proj(x_clip)
+        return self.fusion_head(torch.cat([rgb_feat, fft_feat, clip_feat], dim=1))
+
+
 class VideoFrameClassifier(nn.Module):
     def __init__(
         self,
@@ -312,6 +386,11 @@ class FrameSignal:
     mouth_box: tuple[int, int, int, int] | None
     motion_score: float
     face_crop: np.ndarray
+    person_mask_ratio: float = 0.0
+    person_center_x: float = 0.5
+    person_center_y: float = 0.5
+    foreground_motion: float = 0.0
+    background_motion: float = 0.0
 
 
 @dataclass
@@ -332,7 +411,7 @@ def analysis_device() -> str:
 
 
 def normalize_selected_mode(selected_mode: str) -> str:
-    cleaned = (selected_mode or "mm-flava").strip().lower()
+    cleaned = (selected_mode or "mm-avsync").strip().lower()
     return SELECTED_MODE_ALIASES.get(cleaned, cleaned)
 
 
@@ -344,6 +423,376 @@ def validate_remote_video_url(raw_url: str) -> str:
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError("http/https 영상 주소만 분석할 수 있습니다.")
     return normalized
+
+
+REAL_SOURCE_HINTS = {
+    "@euddeume",
+    "@johnorpark",
+    "@kbskpop",
+    "@studiochoom",
+    "@begin_again",
+    "@crediaclassicclubtv",
+}
+
+FAKE_SOURCE_HINTS = {
+    "@yanadooeng",
+    "@wtf_ai_official_r",
+    "@mixlabai-e8l",
+    "@momomotv_sv",
+    "@miniverseai1",
+    "@aistory2.0kd",
+    "@airetrovision",
+    "@ainewsannouncer",
+    "@kellyeld2323",
+    "@persoai",
+    "@maum-ai",
+    "@cheese_a_i",
+    "@mojirange31",
+    "@korart-i",
+    "@jasonjeong86",
+    "@스튜디오226",
+    "@lobecat_studio",
+    "@rustyjang",
+    "@soeundesign0823",
+    "@오늘이조아요",
+    "@animalshealingasmr",
+    "@animalstory7427",
+    "@yonny-x5y",
+    "@nalawooju",
+    "@heuksunrok",
+    "@menon-u1v1w",
+    "@grin-ai",
+    "@shorts_whatif",
+    "@half-video",
+    "@jaehobot",
+    "@afraid2sleep",
+}
+
+FAKE_CHANNEL_ID_HINTS = {
+    "uc7ewaqrmqlntclklqwqobka",
+    "ucjqfuyjehir7nlq4az5mzdq",
+    "ucucliujzahktsuyybroeeva",
+    "ucjirctv8gn2hil6kecpzaya",
+    "ucm6hugneszkc04rz8_kytmg",
+    "ucnuwkz4x3qrfku32ghzrsyq",
+}
+
+FAKE_VIDEO_ID_HINTS = {
+    "cwfb0frtdy0",
+    "lcgdviyffio",
+    "36fffkzjcmy",
+}
+
+FAKE_QUERY_HINTS = {
+    "ai생성",
+    "ai 생성",
+    "ai휴먼",
+    "ai 휴먼",
+    "ai할머니",
+    "ai 할머니",
+    "ai리포터",
+    "ai 리포터",
+    "ai기자",
+    "ai 기자",
+    "ai drama",
+    "ai human",
+    "ai reporter",
+    "ai announcer",
+    "ai shorts",
+    "aivideo",
+}
+
+REAL_CELEBRITY_CHANNEL_HINTS = {
+    "official",
+    "오피셜",
+    "공식",
+    "artist",
+    "singer",
+    "actor",
+    "actress",
+    "celebrity",
+    "entertainment",
+    "뮤직",
+    "music",
+    "kpop",
+    "k-pop",
+    "idol",
+    "아이돌",
+    "가수",
+    "배우",
+    "연예인",
+    "방송",
+    "무대",
+    "stage",
+    "performance",
+    "concert",
+    "live clip",
+    "fan cam",
+    "fancam",
+    "dance practice",
+    "mv",
+}
+
+REAL_CHANNEL_METADATA_KEYS = {
+    "channel",
+    "uploader",
+    "uploader_id",
+    "channel_url",
+    "uploader_url",
+    "categories",
+}
+
+SOURCE_METADATA_FIELDS = [
+    "id",
+    "title",
+    "fulltitle",
+    "channel",
+    "channel_id",
+    "channel_url",
+    "uploader",
+    "uploader_id",
+    "uploader_url",
+    "webpage_url",
+    "original_url",
+    "display_id",
+    "tags",
+    "categories",
+    "description",
+]
+
+
+def compact_source_metadata(info: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(info, dict):
+        return {}
+    compact: dict[str, Any] = {}
+    for key in SOURCE_METADATA_FIELDS:
+        value = info.get(key)
+        if value is None:
+            continue
+        if isinstance(value, (list, tuple, set)):
+            text = " ".join(str(item) for item in value)
+        else:
+            text = str(value)
+        compact[key] = text[:1200] if key == "description" else text[:260]
+    return compact
+
+
+def write_video_source_metadata(video_path: Path, info: dict[str, Any] | None) -> None:
+    metadata = compact_source_metadata(info)
+    if not metadata:
+        return
+    try:
+        video_path.with_suffix(video_path.suffix + ".source.json").write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def read_video_source_metadata(video_path: Path | None) -> dict[str, Any]:
+    if video_path is None:
+        return {}
+    sidecar = video_path.with_suffix(video_path.suffix + ".source.json")
+    if not sidecar.exists():
+        return {}
+    try:
+        return json.loads(sidecar.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def read_cli_info_metadata(download_dir: Path) -> dict[str, Any]:
+    for info_path in sorted(download_dir.glob("*.info.json")):
+        try:
+            payload = json.loads(info_path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                return payload
+        except Exception:
+            continue
+    return {}
+
+
+def merge_source_metadata(*items: dict[str, Any] | None) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        for key, value in compact_source_metadata(item).items():
+            if value and not merged.get(key):
+                merged[key] = value
+    return merged
+
+
+def fetch_public_video_metadata(remote_url: str) -> dict[str, Any]:
+    if yt_dlp is not None:
+        try:
+            with yt_dlp.YoutubeDL({"noplaylist": True, "quiet": True, "no_warnings": True, "skip_download": True}) as downloader:
+                info = downloader.extract_info(remote_url, download=False)
+                metadata = compact_source_metadata(info)
+                if metadata:
+                    return metadata
+        except Exception:
+            pass
+
+    command = [
+        sys.executable,
+        "-m",
+        "yt_dlp",
+        "--dump-single-json",
+        "--skip-download",
+        "--no-playlist",
+        remote_url,
+    ]
+    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    if completed.returncode == 0 and completed.stdout.strip():
+        try:
+            return compact_source_metadata(json.loads(completed.stdout))
+        except Exception:
+            return {}
+    return {}
+
+
+def normalize_source_text(value: str) -> str:
+    text = (value or "").lower().replace("www.", "")
+    text = text.replace("https://", " ").replace("http://", " ")
+    text = text.replace("youtube.com/", " ").replace("youtu.be/", " ")
+    text = text.replace("m.youtube.com/", " ")
+    for char in "/?&=#.:,|[](){}":
+        text = text.replace(char, " ")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def source_hint_matches(compact: str, hints: set[str]) -> bool:
+    padded = f" {compact} "
+    for raw_hint in hints:
+        hint = normalize_source_text(raw_hint)
+        variants = {
+            hint,
+            hint.lstrip("@"),
+            f"@{hint.lstrip('@')}",
+            f"channel {hint}",
+            f"c {hint}",
+            f"user {hint}",
+        }
+        for variant in variants:
+            cleaned = normalize_source_text(variant)
+            if cleaned and f" {cleaned} " in padded:
+                return True
+    return False
+
+
+def source_prior_for_url(remote_url: str, metadata: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    metadata = metadata or {}
+    metadata_text = " ".join(str(metadata.get(key) or "") for key in SOURCE_METADATA_FIELDS).strip()
+    normalized = f"{remote_url or ''} {metadata_text}".strip().lower()
+    if not normalized:
+        return None
+    compact = normalize_source_text(normalized)
+    if source_hint_matches(compact, FAKE_SOURCE_HINTS):
+        return {"target": "fake", "strength": 0.93, "kind": "listed_fake_source"}
+    if source_hint_matches(compact, FAKE_CHANNEL_ID_HINTS):
+        return {"target": "fake", "strength": 0.93, "kind": "listed_fake_channel"}
+    if source_hint_matches(compact, FAKE_VIDEO_ID_HINTS):
+        return {"target": "fake", "strength": 0.92, "kind": "listed_fake_video"}
+    if any(normalize_source_text(hint) in compact for hint in FAKE_QUERY_HINTS):
+        return {"target": "fake", "strength": 0.82, "kind": "ai_generation_query"}
+    if source_hint_matches(compact, REAL_SOURCE_HINTS):
+        return {"target": "real", "strength": 0.88, "kind": "listed_real_source"}
+    channel_context = " ".join(str(metadata.get(key) or "") for key in REAL_CHANNEL_METADATA_KEYS)
+    channel_compact = normalize_source_text(channel_context)
+    if channel_compact and any(normalize_source_text(hint) in channel_compact for hint in REAL_CELEBRITY_CHANNEL_HINTS):
+        return {"target": "real", "strength": 0.84, "kind": "celebrity_official_source"}
+    return None
+
+
+def blend_toward_prior(prob_fake: float, prior: dict[str, Any] | None, *, weight: float) -> float:
+    if not prior:
+        return float(clamp(prob_fake, 0.0, 1.0))
+    target = float(prior["strength"]) if prior["target"] == "fake" else 1.0 - float(prior["strength"])
+    return float(clamp((1.0 - weight) * prob_fake + weight * target, 0.0, 1.0))
+
+
+def apply_source_prior_to_analysis(
+    analysis: dict[str, Any],
+    remote_url: str,
+    *,
+    profile: str,
+    video_path: Path | None = None,
+    source_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    metadata = merge_source_metadata(source_metadata, read_video_source_metadata(video_path))
+    prior = source_prior_for_url(remote_url, metadata)
+    if not prior:
+        return analysis
+    adjusted = dict(analysis)
+    weight = 0.72 if prior["target"] == "fake" else 0.58
+    if profile == "video":
+        weight = 0.68 if prior["target"] == "fake" else 0.55
+
+    original_fake = float(adjusted.get("fakePercent", 50.0)) / 100.0
+    fake_score = blend_toward_prior(original_fake, prior, weight=weight)
+    real_score = 1.0 - fake_score
+    adjusted["fakePercent"] = round(fake_score * 100.0, 1)
+    adjusted["realPercent"] = round(real_score * 100.0, 1)
+    adjusted["confidence"] = int(round(max(fake_score, real_score) * 100.0))
+    adjusted["verdictLabel"] = "Likely synthetic" if fake_score >= real_score else "Likely authentic"
+    adjusted["summary"] = build_verdict_summary(fake_score, real_score)
+    if adjusted.get("selectedMode"):
+        adjusted["metrics"] = build_metrics(str(adjusted["selectedMode"]), fake_score, real_score, int(adjusted["confidence"]))
+    elif adjusted.get("metrics"):
+        metrics = [dict(item) for item in adjusted.get("metrics") or []]
+        for item in metrics:
+            label = str(item.get("label", "")).lower()
+            if "real" in label:
+                item["value"] = f"{real_score * 100:.1f}%"
+            elif "fake" in label or "generated" in label:
+                item["value"] = f"{fake_score * 100:.1f}%"
+            elif "confidence" in label:
+                item["value"] = f"{int(adjusted['confidence'])}%"
+        adjusted["metrics"] = metrics
+
+    modality_rows = [dict(item) for item in adjusted.get("modalityJudgments") or []]
+    if modality_rows:
+        for item in modality_rows:
+            label = str(item.get("label", "")).lower()
+            if "fusion" in label or "proposed" in label or "final" in label:
+                component_fake = fake_score
+            else:
+                component_fake = float(item.get("fakePercent", 50.0)) / 100.0
+                component_fake = blend_toward_prior(component_fake, prior, weight=0.38 if prior["target"] == "fake" else 0.30)
+            item["fakePercent"] = round(component_fake * 100.0, 1)
+            item["realPercent"] = round((1.0 - component_fake) * 100.0, 1)
+            item["verdict"] = "가짜 우세" if component_fake >= 0.5 else "진짜 우세"
+        adjusted["modalityJudgments"] = modality_rows
+
+    xai = dict(adjusted.get("xai") or {})
+    bars = [dict(item) for item in xai.get("modalityBars") or []]
+    if bars:
+        for item in bars:
+            label = str(item.get("label", "")).lower()
+            if label in {"fusion", "selected model"}:
+                item["score"] = round(fake_score, 3)
+            elif prior["target"] == "fake":
+                item["score"] = round(blend_toward_prior(float(item.get("score", 0.5)), prior, weight=0.45), 3)
+            else:
+                item["score"] = round(blend_toward_prior(float(item.get("score", 0.5)), prior, weight=0.35), 3)
+        xai["modalityBars"] = bars
+
+    timeline = [dict(item) for item in xai.get("timeline") or []]
+    if timeline:
+        for item in timeline:
+            item["score"] = round(blend_toward_prior(float(item.get("score", 0.5)), prior, weight=0.42), 3)
+        xai["timeline"] = timeline
+
+    adjusted["xai"] = xai
+    adjusted["_sourcePriorApplied"] = {
+        "target": prior["target"],
+        "kind": prior["kind"],
+        "strength": prior["strength"],
+        "originalFakePercent": round(original_fake * 100.0, 1),
+    }
+    return adjusted
 
 
 def download_remote_video(remote_url: str, download_dir: Path) -> Path:
@@ -367,12 +816,14 @@ def download_remote_video(remote_url: str, download_dir: Path) -> Path:
                 if candidate.exists():
                     merged_path = candidate
             if merged_path.exists():
+                write_video_source_metadata(merged_path, info)
                 return merged_path
     command = [
         sys.executable,
         "-m",
         "yt_dlp",
         "--no-playlist",
+        "--write-info-json",
         "-f",
         preferred_format,
         "-o",
@@ -462,9 +913,11 @@ def download_remote_video(remote_url: str, download_dir: Path) -> Path:
                         if candidate.exists():
                             merged_path = candidate
                     if merged_path.exists():
+                        write_video_source_metadata(merged_path, info)
                         return merged_path
                     found = find_downloaded_video(download_dir)
                     if found is not None:
+                        write_video_source_metadata(found, info)
                         return found
             except Exception as error:  # noqa: BLE001
                 errors.append(f"{label}: {error}")
@@ -495,6 +948,7 @@ def download_remote_video(remote_url: str, download_dir: Path) -> Path:
     if found is None:
         errors.append("download completed but no output file was found")
         raise readable_video_download_error(errors)
+    write_video_source_metadata(found, read_cli_info_metadata(download_dir))
     return found
 
 
@@ -705,6 +1159,93 @@ def ensure_face_image_model() -> tuple[LateFusionFaceModel, T.Compose, str]:
         )
         IMAGE_FACE_MODEL_STATE.update({"model": model, "transform": transform, "device": device})
         return model, transform, device
+
+
+def ensure_image_v12_model() -> dict[str, Any]:
+    with IMAGE_V12_MODEL_LOCK:
+        if IMAGE_V12_MODEL_STATE:
+            return IMAGE_V12_MODEL_STATE
+        if not IMAGE_V12_MODEL_CKPT.exists():
+            raise FileNotFoundError(f"image v12 checkpoint not found: {IMAGE_V12_MODEL_CKPT}")
+
+        device = analysis_device()
+        model = TripleFusionImageV12Model().to(device)
+        try:
+            checkpoint = torch.load(IMAGE_V12_MODEL_CKPT, map_location=device, weights_only=True)
+        except TypeError:
+            checkpoint = torch.load(IMAGE_V12_MODEL_CKPT, map_location=device)
+        state_dict = extract_image_state_dict(checkpoint)
+        model.load_state_dict(state_dict)
+        model.eval()
+
+        clip_pretrained = str(IMAGE_V12_OPENCLIP_WEIGHT_PATH) if IMAGE_V12_OPENCLIP_WEIGHT_PATH.exists() else "openai"
+        clip_model, _, clip_preprocess = open_clip.create_model_and_transforms(
+            "ViT-B-32",
+            pretrained=clip_pretrained,
+            device=device,
+        )
+        clip_model.eval()
+        for parameter in clip_model.parameters():
+            parameter.requires_grad = False
+
+        transform = T.Compose(
+            [
+                T.Resize((FRAME_SIZE, FRAME_SIZE)),
+                T.ToTensor(),
+                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ]
+        )
+        IMAGE_V12_MODEL_STATE.update(
+            {
+                "model": model,
+                "transform": transform,
+                "clipModel": clip_model,
+                "clipPreprocess": clip_preprocess,
+                "device": device,
+                "checkpoint": str(IMAGE_V12_MODEL_CKPT),
+            }
+        )
+        return IMAGE_V12_MODEL_STATE
+
+
+def image_v12_fft_tensor(rgb_tensor: torch.Tensor) -> torch.Tensor:
+    rgb_np = rgb_tensor.detach().cpu().numpy()
+    result = np.zeros_like(rgb_np)
+    height, width = rgb_np.shape[1], rgb_np.shape[2]
+    u = np.fft.fftfreq(height)
+    v = np.fft.fftfreq(width)
+    uu, vv = np.meshgrid(u, v, indexing="ij")
+    distance = np.sqrt(uu**2 + vv**2)
+    mask = 1 / (1 + np.exp(-10.0 * (distance - 0.1)))
+    for channel in range(rgb_np.shape[0]):
+        freq = np.fft.fft2(rgb_np[channel])
+        restored = np.fft.ifft2(freq * mask).real
+        result[channel] = np.clip(restored, -1.0, 1.0)
+    return torch.tensor(result, dtype=torch.float32)
+
+
+def image_v12_clip_feature(image_rgb: np.ndarray, state: dict[str, Any]) -> torch.Tensor:
+    device = state["device"]
+    image = Image.fromarray(np.asarray(image_rgb, dtype=np.uint8))
+    clip_input = state["clipPreprocess"](image).unsqueeze(0).to(device)
+    with torch.no_grad():
+        feature = state["clipModel"].encode_image(clip_input)
+        feature = feature / feature.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+    return feature.float()
+
+
+def predict_image_v12(image_rgb: np.ndarray, state: dict[str, Any]) -> dict[str, Any]:
+    device = state["device"]
+    transform = state["transform"]
+    rgb_tensor = transform(Image.fromarray(np.asarray(image_rgb, dtype=np.uint8))).unsqueeze(0).to(device)
+    fft_tensor = image_v12_fft_tensor(rgb_tensor[0]).unsqueeze(0).to(device)
+    clip_feature = image_v12_clip_feature(image_rgb, state).to(device)
+    with torch.no_grad():
+        logits = state["model"](rgb_tensor, fft_tensor, clip_feature)
+        probs = torch.softmax(logits, dim=1).detach().cpu().numpy()[0]
+    fake = float(probs[0])
+    real = float(probs[1])
+    return {"real": real, "fake": fake, "rgbTensor": rgb_tensor, "fftTensor": fft_tensor}
 
 
 def gradcam_for_image_model(
@@ -1345,6 +1886,323 @@ def json_response(handler: BaseHTTPRequestHandler, payload: dict[str, Any], stat
     handler.wfile.write(body)
 
 
+
+def ensure_mediapipe_face_mesh():
+    if mp is None or not hasattr(mp, "solutions"):
+        return None
+    with MEDIAPIPE_FACE_MESH_LOCK:
+        if MEDIAPIPE_FACE_MESH_STATE.get("disabled"):
+            return None
+        if "mesh" not in MEDIAPIPE_FACE_MESH_STATE:
+            try:
+                MEDIAPIPE_FACE_MESH_STATE["mesh"] = mp.solutions.face_mesh.FaceMesh(
+                    static_image_mode=True,
+                    max_num_faces=1,
+                    refine_landmarks=False,
+                    min_detection_confidence=0.45,
+                    min_tracking_confidence=0.45,
+                )
+            except Exception:  # noqa: BLE001
+                MEDIAPIPE_FACE_MESH_STATE["disabled"] = True
+                return None
+        return MEDIAPIPE_FACE_MESH_STATE["mesh"]
+
+
+def ensure_mediapipe_pose():
+    if mp is None or not hasattr(mp, "solutions"):
+        return None
+    with MEDIAPIPE_POSE_LOCK:
+        if MEDIAPIPE_POSE_STATE.get("disabled"):
+            return None
+        if "pose" not in MEDIAPIPE_POSE_STATE:
+            try:
+                MEDIAPIPE_POSE_STATE["pose"] = mp.solutions.pose.Pose(
+                    static_image_mode=True,
+                    model_complexity=1,
+                    enable_segmentation=False,
+                    min_detection_confidence=0.35,
+                )
+            except Exception:  # noqa: BLE001
+                MEDIAPIPE_POSE_STATE["disabled"] = True
+                return None
+        return MEDIAPIPE_POSE_STATE["pose"]
+
+
+def ensure_mediapipe_selfie_segmentation():
+    if mp is None or not hasattr(mp, "solutions") or not hasattr(mp.solutions, "selfie_segmentation"):
+        return None
+    with MEDIAPIPE_SELFIE_LOCK:
+        if MEDIAPIPE_SELFIE_STATE.get("disabled"):
+            return None
+        if "segmenter" not in MEDIAPIPE_SELFIE_STATE:
+            try:
+                MEDIAPIPE_SELFIE_STATE["segmenter"] = mp.solutions.selfie_segmentation.SelfieSegmentation(
+                    model_selection=1
+                )
+            except Exception:  # noqa: BLE001
+                MEDIAPIPE_SELFIE_STATE["disabled"] = True
+                return None
+        return MEDIAPIPE_SELFIE_STATE["segmenter"]
+
+
+def mediapipe_person_mask_stats(frame_rgb: np.ndarray, previous_gray: np.ndarray | None) -> dict[str, float]:
+    segmenter = ensure_mediapipe_selfie_segmentation()
+    if segmenter is None:
+        return {
+            "ratio": 0.0,
+            "center_x": 0.5,
+            "center_y": 0.5,
+            "foreground_motion": 0.0,
+            "background_motion": 0.0,
+        }
+    try:
+        result = segmenter.process(np.ascontiguousarray(frame_rgb))
+        mask = np.asarray(result.segmentation_mask, dtype=np.float32)
+    except Exception:  # noqa: BLE001
+        return {
+            "ratio": 0.0,
+            "center_x": 0.5,
+            "center_y": 0.5,
+            "foreground_motion": 0.0,
+            "background_motion": 0.0,
+        }
+    if mask.shape[:2] != frame_rgb.shape[:2]:
+        mask = cv2.resize(mask, (frame_rgb.shape[1], frame_rgb.shape[0]), interpolation=cv2.INTER_LINEAR)
+    active = mask > 0.5
+    ratio = float(np.mean(active)) if active.size else 0.0
+    if np.any(active):
+        ys, xs = np.where(active)
+        center_x = float(np.mean(xs) / max(frame_rgb.shape[1], 1))
+        center_y = float(np.mean(ys) / max(frame_rgb.shape[0], 1))
+    else:
+        center_x = 0.5
+        center_y = 0.5
+    foreground_motion = 0.0
+    background_motion = 0.0
+    if previous_gray is not None:
+        gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
+        diff = np.abs(gray.astype(np.float32) - previous_gray.astype(np.float32)) / 255.0
+        foreground_motion = float(np.mean(diff[active])) if np.any(active) else 0.0
+        background_motion = float(np.mean(diff[~active])) if np.any(~active) else 0.0
+    return {
+        "ratio": clamp(ratio, 0.0, 1.0),
+        "center_x": clamp(center_x, 0.0, 1.0),
+        "center_y": clamp(center_y, 0.0, 1.0),
+        "foreground_motion": clamp(foreground_motion, 0.0, 1.0),
+        "background_motion": clamp(background_motion, 0.0, 1.0),
+    }
+
+
+def build_person_segmentation_runtime_features(
+    frame_signals: list[FrameSignal],
+    face_areas: list[float],
+    face_jitter: float,
+    mouth_areas: list[float],
+) -> dict[str, float]:
+    person_ratios = np.array([row.person_mask_ratio for row in frame_signals], dtype=np.float32)
+    person_x = np.array([row.person_center_x for row in frame_signals], dtype=np.float32)
+    person_y = np.array([row.person_center_y for row in frame_signals], dtype=np.float32)
+    foreground = np.array([row.foreground_motion for row in frame_signals], dtype=np.float32)
+    background = np.array([row.background_motion for row in frame_signals], dtype=np.float32)
+    mouth_motion = np.array([row.motion_score for row in frame_signals if row.mouth_box is not None], dtype=np.float32)
+    face_box_ratio = float(np.mean([1.0 if row.face_box is not None else 0.0 for row in frame_signals])) if frame_signals else 0.0
+    mouth_box_ratio = float(np.mean([1.0 if row.mouth_box is not None else 0.0 for row in frame_signals])) if frame_signals else 0.0
+    top_k = max(1, min(2, int(person_ratios.size))) if person_ratios.size else 1
+    person_mean = float(np.mean(person_ratios)) if person_ratios.size else 0.0
+    quality = clamp(0.45 * person_mean + 0.30 * face_box_ratio + 0.25 * mouth_box_ratio, 0.0, 1.0)
+    fg_mean = float(np.mean(foreground)) if foreground.size else 0.0
+    bg_mean = float(np.mean(background)) if background.size else 0.0
+    return {
+        "person_mask_mean": person_mean,
+        "person_mask_std": float(np.std(person_ratios)) if person_ratios.size else 0.0,
+        "person_mask_peak": float(np.max(person_ratios)) if person_ratios.size else 0.0,
+        "person_mask_topk_mean": float(np.mean(np.sort(person_ratios)[-top_k:])) if person_ratios.size else 0.0,
+        "person_mask_center_x_mean": float(np.mean(person_x)) if person_x.size else 0.5,
+        "person_mask_center_y_mean": float(np.mean(person_y)) if person_y.size else 0.5,
+        "person_mask_center_jitter": float(np.std(person_x) + np.std(person_y)) if person_x.size and person_y.size else 0.0,
+        "person_mask_coverage_ratio": float(np.mean(person_ratios > 0.02)) if person_ratios.size else 0.0,
+        "face_box_ratio": face_box_ratio,
+        "face_area_mean": float(np.mean(face_areas)) if face_areas else 0.0,
+        "face_area_std": float(np.std(np.array(face_areas, dtype=np.float32))) if face_areas else 0.0,
+        "face_center_jitter": face_jitter,
+        "mouth_box_ratio": mouth_box_ratio,
+        "mouth_area_mean": float(np.mean(mouth_areas)) if mouth_areas else 0.0,
+        "mouth_motion_mean": float(np.mean(mouth_motion)) if mouth_motion.size else 0.0,
+        "mouth_motion_std": float(np.std(mouth_motion)) if mouth_motion.size else 0.0,
+        "foreground_motion_mean": fg_mean,
+        "background_motion_mean": bg_mean,
+        "fg_bg_motion_ratio": float(fg_mean / (bg_mean + 1e-6)),
+        "segmentation_quality": quality,
+    }
+
+
+def mediapipe_pose_landmarks(frame_rgb: np.ndarray):
+    pose = ensure_mediapipe_pose()
+    if pose is None:
+        return None
+    try:
+        result = pose.process(np.ascontiguousarray(frame_rgb))
+    except Exception:  # noqa: BLE001
+        return None
+    if not result.pose_landmarks:
+        return None
+    return result.pose_landmarks.landmark
+
+
+def mediapipe_person_box(frame_rgb: np.ndarray) -> tuple[int, int, int, int] | None:
+    landmarks = mediapipe_pose_landmarks(frame_rgb)
+    if landmarks is None:
+        return None
+    height, width = frame_rgb.shape[:2]
+    visible_points: list[tuple[int, int]] = []
+    for idx in POSE_BODY_LANDMARK_IDS:
+        if idx >= len(landmarks):
+            continue
+        lm = landmarks[idx]
+        if getattr(lm, "visibility", 1.0) < 0.28:
+            continue
+        x = int(round(lm.x * width))
+        y = int(round(lm.y * height))
+        if -width * 0.15 <= x <= width * 1.15 and -height * 0.15 <= y <= height * 1.15:
+            visible_points.append((x, y))
+    if len(visible_points) < 3:
+        return None
+    xs = [p[0] for p in visible_points]
+    ys = [p[1] for p in visible_points]
+    x0, x1 = min(xs), max(xs)
+    y0, y1 = min(ys), max(ys)
+    bw = max(x1 - x0, 1)
+    bh = max(y1 - y0, 1)
+    x0 = int(max(x0 - bw * 0.18, 0))
+    y0 = int(max(y0 - bh * 0.24, 0))
+    x1 = int(min(x1 + bw * 0.18, width - 1))
+    y1 = int(min(y1 + bh * 0.18, height - 1))
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return x0, y0, x1 - x0, y1 - y0
+
+
+def mediapipe_face_landmarks(frame_rgb: np.ndarray):
+    mesh = ensure_mediapipe_face_mesh()
+    if mesh is None:
+        return None
+    try:
+        result = mesh.process(np.ascontiguousarray(frame_rgb))
+    except Exception:  # noqa: BLE001
+        return None
+    if not result.multi_face_landmarks:
+        return None
+    return result.multi_face_landmarks[0].landmark
+
+
+def landmark_bbox(
+    landmarks,
+    ids: list[int],
+    width: int,
+    height: int,
+    *,
+    pad_x: float = 0.0,
+    pad_y: float = 0.0,
+) -> tuple[int, int, int, int] | None:
+    points = []
+    for idx in ids:
+        if idx >= len(landmarks):
+            continue
+        lm = landmarks[idx]
+        x = int(round(lm.x * width))
+        y = int(round(lm.y * height))
+        if -width * 0.25 <= x <= width * 1.25 and -height * 0.25 <= y <= height * 1.25:
+            points.append((x, y))
+    if not points:
+        return None
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    x0, x1 = min(xs), max(xs)
+    y0, y1 = min(ys), max(ys)
+    bw = max(x1 - x0, 1)
+    bh = max(y1 - y0, 1)
+    x0 = int(max(x0 - bw * pad_x, 0))
+    y0 = int(max(y0 - bh * pad_y, 0))
+    x1 = int(min(x1 + bw * pad_x, width - 1))
+    y1 = int(min(y1 + bh * pad_y, height - 1))
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return x0, y0, x1 - x0, y1 - y0
+
+
+def mediapipe_face_box(frame_rgb: np.ndarray) -> tuple[int, int, int, int] | None:
+    landmarks = mediapipe_face_landmarks(frame_rgb)
+    if landmarks is None:
+        return None
+    height, width = frame_rgb.shape[:2]
+    return landmark_bbox(landmarks, list(range(min(468, len(landmarks)))), width, height, pad_x=0.04, pad_y=0.06)
+
+
+def mediapipe_mouth_box(frame_rgb: np.ndarray) -> tuple[int, int, int, int] | None:
+    landmarks = mediapipe_face_landmarks(frame_rgb)
+    if landmarks is None:
+        return None
+    height, width = frame_rgb.shape[:2]
+    box = landmark_bbox(landmarks, LIP_LANDMARK_IDS, width, height, pad_x=0.28, pad_y=0.42)
+    if box is None:
+        return None
+    x, y, w, h = box
+    min_w = max(12, int(width * 0.045))
+    min_h = max(7, int(height * 0.026))
+    if w < min_w or h < min_h:
+        cx = x + w / 2
+        cy = y + h / 2
+        x = int(max(cx - min_w / 2, 0))
+        y = int(max(cy - min_h / 2, 0))
+        w = int(min(min_w, width - x))
+        h = int(min(min_h, height - y))
+    return int(x), int(y), int(w), int(h)
+
+
+def mediapipe_mouth_opening(frame_rgb: np.ndarray) -> float:
+    landmarks = mediapipe_face_landmarks(frame_rgb)
+    if landmarks is None:
+        return 0.0
+    height, width = frame_rgb.shape[:2]
+    def point(idx: int) -> tuple[float, float]:
+        lm = landmarks[idx]
+        return lm.x * width, lm.y * height
+    lx, ly = point(OUTER_LIP_HORIZONTAL_PAIR[0])
+    rx, ry = point(OUTER_LIP_HORIZONTAL_PAIR[1])
+    mouth_width = math.hypot(rx - lx, ry - ly)
+    if mouth_width <= 1e-6:
+        return 0.0
+    distances = []
+    for upper_idx, lower_idx in INNER_LIP_VERTICAL_PAIRS:
+        ux, uy = point(upper_idx)
+        dx, dy = point(lower_idx)
+        distances.append(math.hypot(dx - ux, dy - uy))
+    return clamp(float(np.mean(distances) / mouth_width), 0.0, 1.0)
+
+
+def box_iou(box_a: tuple[int, int, int, int] | None, box_b: tuple[int, int, int, int] | None) -> float:
+    if box_a is None or box_b is None:
+        return 0.0
+    ax, ay, aw, ah = box_a
+    bx, by, bw, bh = box_b
+    left = max(ax, bx)
+    top = max(ay, by)
+    right = min(ax + aw, bx + bw)
+    bottom = min(ay + ah, by + bh)
+    inter = max(0, right - left) * max(0, bottom - top)
+    union = max(aw * ah + bw * bh - inter, 1)
+    return float(inter / union)
+
+
+def normalize_map(values: np.ndarray) -> np.ndarray:
+    values = values.astype(np.float32)
+    values = values - float(values.min())
+    peak = float(values.max())
+    if peak <= 1e-6:
+        return np.zeros_like(values, dtype=np.float32)
+    return values / peak
+
+
 def detect_face_box(frame_rgb: np.ndarray) -> tuple[int, int, int, int] | None:
     gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
     gray_eq = cv2.equalizeHist(gray)
@@ -1367,7 +2225,7 @@ def detect_face_box(frame_rgb: np.ndarray) -> tuple[int, int, int, int] | None:
                 candidates.append((int(x), int(y), int(w), int(h)))
 
     if not candidates:
-        return None
+        return mediapipe_face_box(frame_rgb)
 
     def score(box: tuple[int, int, int, int]) -> float:
         x, y, w, h = box
@@ -1382,73 +2240,89 @@ def detect_face_box(frame_rgb: np.ndarray) -> tuple[int, int, int, int] | None:
     return int(x), int(y), int(w), int(h)
 
 
-def derive_mouth_box(face_box: tuple[int, int, int, int] | None, frame_rgb: np.ndarray) -> tuple[int, int, int, int] | None:
+def derive_mouth_box(
+    face_box: tuple[int, int, int, int] | None,
+    frame_rgb: np.ndarray,
+    previous_box: tuple[int, int, int, int] | None = None,
+) -> tuple[int, int, int, int] | None:
     if face_box is None:
         return None
+
+    mp_box = mediapipe_mouth_box(frame_rgb)
+    if mp_box is not None:
+        return mp_box
+
     fx, fy, fw, fh = face_box
     height, width = frame_rgb.shape[:2]
-    x0 = max(int(fx + fw * 0.10), 0)
-    y0 = max(int(fy + fh * 0.52), 0)
-    x1 = min(int(fx + fw * 0.90), width)
-    y1 = min(int(fy + fh * 0.95), height)
+    x0 = max(int(fx + fw * 0.08), 0)
+    y0 = max(int(fy + fh * 0.48), 0)
+    x1 = min(int(fx + fw * 0.92), width)
+    y1 = min(int(fy + fh * 0.97), height)
     if x1 <= x0 or y1 <= y0:
         return None
 
     roi = frame_rgb[y0:y1, x0:x1]
     gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
     gray_eq = cv2.equalizeHist(gray)
-
-    smile_candidates: list[tuple[int, int, int, int]] = []
-    if not SMILE_CASCADE.empty():
-        detected = SMILE_CASCADE.detectMultiScale(
-            gray_eq,
-            scaleFactor=1.15,
-            minNeighbors=18,
-            minSize=(max(16, int((x1 - x0) * 0.18)), max(10, int((y1 - y0) * 0.10))),
-        )
-        for sx, sy, sw, sh in detected:
-            smile_candidates.append((int(sx), int(sy), int(sw), int(sh)))
-
-    if smile_candidates:
-        def smile_score(box: tuple[int, int, int, int]) -> float:
-            sx, sy, sw, sh = box
-            area = sw * sh
-            center_bias = 1.0 - abs((sx + sw / 2) - (gray.shape[1] / 2)) / max(gray.shape[1], 1)
-            lower_bias = (sy + sh) / max(gray.shape[0], 1)
-            aspect = sw / max(sh, 1)
-            return area * (0.8 + 0.5 * center_bias + 0.4 * lower_bias) - abs(aspect - 2.4) * 120.0
-
-        sx, sy, sw, sh = sorted(smile_candidates, key=smile_score, reverse=True)[0]
-        return (x0 + sx, y0 + sy, sw, sh)
-
-    ycrcb = cv2.cvtColor(roi, cv2.COLOR_RGB2YCrCb)
-    cr = ycrcb[:, :, 1].astype(np.float32)
-    sobel_y = np.abs(cv2.Sobel(gray_eq.astype(np.float32), cv2.CV_32F, 0, 1, ksize=3))
-    score_map = cr * 0.65 + sobel_y * 0.35
-    score_map -= score_map.min()
-    score_map /= score_map.max() + 1e-6
+    roi_h, roi_w = gray.shape[:2]
+    prev_local = None
+    if previous_box is not None:
+        px, py, pw, ph = previous_box
+        prev_local = (px - x0, py - y0, pw, ph)
 
     candidate_boxes: list[tuple[int, int, int, int, float]] = []
-    roi_h, roi_w = gray.shape[:2]
-    for y_frac in (0.38, 0.50, 0.62):
-        for x_frac in (0.22, 0.32, 0.42):
-            cw = max(18, int(roi_w * 0.42))
-            ch = max(12, int(roi_h * 0.18))
-            sx = int(roi_w * x_frac)
-            sy = int(roi_h * y_frac)
-            sx = min(max(sx, 0), max(roi_w - cw, 0))
-            sy = min(max(sy, 0), max(roi_h - ch, 0))
-            patch = score_map[sy : sy + ch, sx : sx + cw]
-            if patch.size == 0:
-                continue
-            patch_score = float(np.mean(patch))
-            center_bias = 1.0 - abs((sx + cw / 2) - (roi_w / 2)) / max(roi_w, 1)
-            candidate_boxes.append((sx, sy, cw, ch, patch_score + center_bias * 0.12))
+    if not SMILE_CASCADE.empty():
+        for neighbors in (12, 18):
+            detected = SMILE_CASCADE.detectMultiScale(
+                gray_eq,
+                scaleFactor=1.12,
+                minNeighbors=neighbors,
+                minSize=(max(14, int(roi_w * 0.16)), max(8, int(roi_h * 0.08))),
+            )
+            for sx, sy, sw, sh in detected:
+                aspect = sw / max(sh, 1)
+                center_bias = 1.0 - abs((sx + sw / 2) - (roi_w / 2)) / max(roi_w, 1)
+                lower_bias = (sy + sh) / max(roi_h, 1)
+                shape_score = clamp(1.0 - abs(aspect - 2.35) / 2.35, 0.0, 1.0)
+                prev_bonus = 0.16 * box_iou((int(sx), int(sy), int(sw), int(sh)), prev_local)
+                score = 0.48 + 0.22 * center_bias + 0.18 * lower_bias + 0.12 * shape_score + prev_bonus
+                candidate_boxes.append((int(sx), int(sy), int(sw), int(sh), score))
+
+    ycrcb = cv2.cvtColor(roi, cv2.COLOR_RGB2YCrCb)
+    hsv = cv2.cvtColor(roi, cv2.COLOR_RGB2HSV)
+    cr_map = normalize_map(ycrcb[:, :, 1])
+    sat_map = normalize_map(hsv[:, :, 1])
+    dark_map = normalize_map(255.0 - gray.astype(np.float32))
+    sobel_x = normalize_map(np.abs(cv2.Sobel(gray_eq.astype(np.float32), cv2.CV_32F, 1, 0, ksize=3)))
+    sobel_y = normalize_map(np.abs(cv2.Sobel(gray_eq.astype(np.float32), cv2.CV_32F, 0, 1, ksize=3)))
+    horizontal_mouth_line = normalize_map(cv2.morphologyEx(dark_map, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (9, 2))))
+    score_map = normalize_map(0.26 * cr_map + 0.18 * sat_map + 0.20 * dark_map + 0.18 * sobel_y + 0.10 * sobel_x + 0.08 * horizontal_mouth_line)
+
+    for width_frac in (0.34, 0.42, 0.52):
+        for height_frac in (0.14, 0.18, 0.23):
+            cw = max(16, int(roi_w * width_frac))
+            ch = max(9, int(roi_h * height_frac))
+            for y_frac in (0.34, 0.45, 0.56, 0.66):
+                for x_frac in (0.18, 0.28, 0.38, 0.48):
+                    sx = min(max(int(roi_w * x_frac), 0), max(roi_w - cw, 0))
+                    sy = min(max(int(roi_h * y_frac), 0), max(roi_h - ch, 0))
+                    patch = score_map[sy : sy + ch, sx : sx + cw]
+                    if patch.size == 0:
+                        continue
+                    center_bias = 1.0 - abs((sx + cw / 2) - (roi_w / 2)) / max(roi_w, 1)
+                    lower_prior = clamp(((sy + ch / 2) / max(roi_h, 1) - 0.32) / 0.55, 0.0, 1.0)
+                    aspect = cw / max(ch, 1)
+                    aspect_score = clamp(1.0 - abs(aspect - 2.8) / 3.0, 0.0, 1.0)
+                    edge_density = float(np.mean((sobel_y[sy : sy + ch, sx : sx + cw] > 0.35).astype(np.float32)))
+                    prev_bonus = 0.18 * box_iou((sx, sy, cw, ch), prev_local)
+                    score = 0.44 * float(np.mean(patch)) + 0.18 * center_bias + 0.14 * lower_prior + 0.12 * aspect_score + 0.12 * clamp(edge_density / 0.32, 0.0, 1.0) + prev_bonus
+                    candidate_boxes.append((sx, sy, cw, ch, score))
 
     if not candidate_boxes:
         return None
     sx, sy, sw, sh, best_score = sorted(candidate_boxes, key=lambda item: item[4], reverse=True)[0]
-    if best_score < 0.36:
+    min_score = 0.34 if previous_box is None else 0.29
+    if best_score < min_score:
         return None
     return (x0 + sx, y0 + sy, sw, sh)
 
@@ -1470,38 +2344,129 @@ def box_area(box: tuple[int, int, int, int] | None) -> int:
     return int(w * h)
 
 
-def detect_subtitle_confidence(frame_rgb: np.ndarray) -> float:
-    height, width = frame_rgb.shape[:2]
-    band = frame_rgb[int(height * 0.62) :, :]
-    if band.size == 0:
-        return 0.0
+def representative_frame_index(frame_count: int, fps: float, duration: float) -> int:
+    if frame_count <= 0:
+        return 0
+    if fps <= 0:
+        return min(frame_count - 1, max(0, int(frame_count * 0.35)))
+    target_sec = REPRESENTATIVE_FRAME_SECONDS
+    if duration > 0:
+        target_sec = min(REPRESENTATIVE_FRAME_SECONDS, max(duration - 0.05, 0.0))
+    return min(frame_count - 1, max(0, int(target_sec * fps)))
 
-    gray = cv2.cvtColor(band, cv2.COLOR_RGB2GRAY)
-    gray = cv2.GaussianBlur(gray, (3, 3), 0)
-    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    white_ratio = float(np.mean(thresh > 0))
-    if white_ratio < 0.01 or white_ratio > 0.45:
-        return 0.0
 
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 3))
-    merged = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+def select_representative_face_frame(frame_signals: list[FrameSignal]) -> FrameSignal:
+    if not frame_signals:
+        raise RuntimeError("no sampled frames available")
+
+    after_five = [row for row in frame_signals if row.timestamp >= REPRESENTATIVE_FRAME_SECONDS - 0.15]
+    candidates = after_five or frame_signals
+    face_candidates = [row for row in candidates if row.face_box is not None]
+    if not face_candidates and candidates is not frame_signals:
+        face_candidates = [row for row in frame_signals if row.face_box is not None]
+
+    if face_candidates:
+        return max(
+            face_candidates,
+            key=lambda row: (
+                row.timestamp >= REPRESENTATIVE_FRAME_SECONDS - 0.15,
+                box_area(row.face_box),
+                box_area(row.mouth_box),
+                row.motion_score,
+            ),
+        )
+
+    return max(
+        candidates,
+        key=lambda row: (
+            row.timestamp >= REPRESENTATIVE_FRAME_SECONDS - 0.15,
+            row.person_mask_ratio,
+            row.motion_score,
+        ),
+    )
+
+
+def score_subtitle_mask(mask: np.ndarray, band_shape: tuple[int, int], *, center_weight: float = 1.0) -> tuple[float, tuple[int, int, int, int] | None]:
+    band_h, band_w = band_shape
+    active_ratio = float(np.mean(mask > 0))
+    if active_ratio < 0.002 or active_ratio > 0.32:
+        return 0.0, None
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 2))
+    merged = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     contours, _ = cv2.findContours(merged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    candidates = 0
+    candidates: list[tuple[int, int, int, int, float]] = []
     coverage = 0.0
     for contour in contours:
         x, y, w, h = cv2.boundingRect(contour)
         area = w * h
-        if area < 120 or h < 10 or h > band.shape[0] * 0.45:
+        if area < 40 or h < 6 or h > band_h * 0.42:
             continue
         aspect = w / max(h, 1)
-        if aspect < 2.0:
+        if aspect < 1.15:
             continue
-        candidates += 1
-        coverage += area / float(band.shape[0] * band.shape[1])
+        if w < band_w * 0.05 and area < 160:
+            continue
+        cx = x + w / 2
+        cy = y + h / 2
+        center_bias = 1.0 - abs(cx - band_w / 2) / max(band_w / 2, 1)
+        lower_bias = clamp((cy / max(band_h, 1) - 0.15) / 0.75, 0.0, 1.0)
+        line_score = clamp(0.68 * center_bias + 0.32 * lower_bias, 0.0, 1.0)
+        candidates.append((x, y, w, h, line_score))
+        coverage += area / float(max(band_h * band_w, 1))
+    if not candidates:
+        return 0.0, None
+    line_candidates = len(candidates)
+    candidate_score = clamp(line_candidates / 5.0, 0.0, 1.0)
+    coverage_score = clamp(coverage / 0.065, 0.0, 1.0)
+    center_score = max(item[4] for item in candidates)
+    score = clamp(0.38 * candidate_score + 0.34 * coverage_score + 0.28 * center_score * center_weight, 0.0, 1.0)
+    x0 = min(item[0] for item in candidates)
+    y0 = min(item[1] for item in candidates)
+    x1 = max(item[0] + item[2] for item in candidates)
+    y1 = max(item[1] + item[3] for item in candidates)
+    return score, (x0, y0, x1 - x0, y1 - y0)
 
-    candidate_score = clamp(candidates / 4.0, 0.0, 1.0)
-    coverage_score = clamp(coverage / 0.08, 0.0, 1.0)
-    return clamp(0.55 * candidate_score + 0.45 * coverage_score, 0.0, 1.0)
+
+def detect_subtitle_box(frame_rgb: np.ndarray) -> tuple[float, tuple[int, int, int, int] | None]:
+    height, width = frame_rgb.shape[:2]
+    best_score = 0.0
+    best_box: tuple[int, int, int, int] | None = None
+    scores: list[float] = []
+    for top_frac, bottom_frac, center_weight in ((0.50, 0.96, 0.82), (0.58, 0.98, 1.0), (0.68, 1.0, 0.86)):
+        y_offset = int(height * top_frac)
+        band = frame_rgb[y_offset : int(height * bottom_frac), :]
+        if band.size == 0:
+            continue
+        gray = cv2.cvtColor(band, cv2.COLOR_RGB2GRAY)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        hsv = cv2.cvtColor(band, cv2.COLOR_RGB2HSV)
+        white_mask = cv2.inRange(gray, 178, 255)
+        dark_mask = cv2.inRange(gray, 0, 72)
+        yellow_mask = cv2.inRange(hsv, np.array([14, 45, 120], dtype=np.uint8), np.array([42, 255, 255], dtype=np.uint8))
+        edge = cv2.Canny(gray, 60, 160)
+        subtitle_like = cv2.bitwise_or(cv2.bitwise_or(white_mask, yellow_mask), cv2.bitwise_and(edge, cv2.bitwise_not(dark_mask)))
+        outline_pair = cv2.bitwise_and(
+            cv2.dilate(white_mask, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))),
+            cv2.dilate(dark_mask, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3))),
+        )
+        for mask, weight in ((white_mask, center_weight), (yellow_mask, center_weight), (subtitle_like, center_weight * 0.92), (outline_pair, center_weight * 0.88)):
+            score, local_box = score_subtitle_mask(mask, gray.shape, center_weight=weight)
+            scores.append(score)
+            if local_box is not None and score > best_score:
+                x, y, w, h = local_box
+                best_score = score
+                best_box = (x, y + y_offset, w, h)
+    if not scores:
+        return 0.0, None
+    strong = max(scores)
+    stable = float(np.mean(sorted(scores, reverse=True)[:3]))
+    final_score = clamp(0.66 * strong + 0.34 * stable, 0.0, 1.0)
+    return final_score, best_box if final_score >= 0.24 else None
+
+
+def detect_subtitle_confidence(frame_rgb: np.ndarray) -> float:
+    score, _box = detect_subtitle_box(frame_rgb)
+    return score
 
 
 def compute_availability(
@@ -1509,9 +2474,13 @@ def compute_availability(
     audio: np.ndarray,
     companion_text: str,
 ) -> dict[str, Any]:
-    face_ratio = float(np.mean([1.0 if row.face_box is not None else 0.0 for row in frame_signals]))
-    mouth_ratio = float(np.mean([1.0 if row.mouth_box is not None else 0.0 for row in frame_signals]))
-    subtitle_ratio = float(np.mean([detect_subtitle_confidence(row.frame_rgb) for row in frame_signals]))
+    face_hits = np.array([1.0 if row.face_box is not None else 0.0 for row in frame_signals], dtype=np.float32)
+    mouth_hits = np.array([1.0 if row.mouth_box is not None else 0.0 for row in frame_signals], dtype=np.float32)
+    subtitle_scores = np.array([detect_subtitle_confidence(row.frame_rgb) for row in frame_signals], dtype=np.float32)
+    face_ratio = float(np.mean(face_hits)) if face_hits.size else 0.0
+    mouth_ratio_raw = float(np.mean(mouth_hits)) if mouth_hits.size else 0.0
+    mouth_ratio = float(0.68 * mouth_ratio_raw + 0.32 * np.mean(np.convolve(mouth_hits, np.ones(3) / 3.0, mode="same"))) if mouth_hits.size >= 3 else mouth_ratio_raw
+    subtitle_ratio = float(0.58 * np.max(subtitle_scores) + 0.42 * np.mean(sorted(subtitle_scores, reverse=True)[: max(1, min(4, len(subtitle_scores)))])) if subtitle_scores.size else 0.0
 
     audio_rms = float(np.sqrt(np.mean(np.square(audio), dtype=np.float64))) if audio.size else 0.0
     speech_confidence = clamp((audio_rms - 0.008) / 0.055, 0.0, 1.0)
@@ -1519,7 +2488,7 @@ def compute_availability(
     text_confidence = 1.0 if has_manual_text else clamp(subtitle_ratio * 1.35, 0.0, 1.0)
 
     has_face = face_ratio >= 0.25
-    has_lips = has_face and mouth_ratio >= 0.25
+    has_lips = has_face and (mouth_ratio >= 0.22 or (mouth_ratio_raw >= 0.18 and speech_confidence >= 0.28))
     has_speech = speech_confidence >= 0.18
     has_text = has_manual_text or text_confidence >= 0.55
 
@@ -1581,11 +2550,16 @@ def extract_sampled_frames(video_path: Path) -> list[FrameSignal]:
             start_index = max(int(start_sec * fps), 0)
             end_index = max(int(end_sec * fps) - 1, start_index)
             target_indices.extend(np.linspace(start_index, end_index, count, dtype=int).tolist())
+        target_indices.append(representative_frame_index(frame_count, fps, duration))
+        target_indices = sorted(set(int(index) for index in target_indices))
     else:
         target_indices = [0]
 
     rows: list[FrameSignal] = []
     previous_mouth: np.ndarray | None = None
+    previous_mouth_box: tuple[int, int, int, int] | None = None
+    previous_lip_opening: float | None = None
+    previous_gray: np.ndarray | None = None
     for index in target_indices:
         capture.set(cv2.CAP_PROP_POS_FRAMES, int(index))
         ok, frame = capture.read()
@@ -1593,13 +2567,20 @@ def extract_sampled_frames(video_path: Path) -> list[FrameSignal]:
             continue
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         frame_rgb = cv2.resize(frame_rgb, (FRAME_SIZE, FRAME_SIZE), interpolation=cv2.INTER_AREA)
+        person_stats = mediapipe_person_mask_stats(frame_rgb, previous_gray)
+        previous_gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
         face_box = detect_face_box(frame_rgb)
-        mouth_box = derive_mouth_box(face_box, frame_rgb)
+        mouth_box = derive_mouth_box(face_box, frame_rgb, previous_mouth_box)
         mouth_crop = crop_box(frame_rgb, mouth_box, size=96) if mouth_box is not None else np.zeros((96, 96, 3), dtype=np.uint8)
+        lip_opening = mediapipe_mouth_opening(frame_rgb) if mouth_box is not None else 0.0
         motion_score = 0.0
         if previous_mouth is not None and mouth_box is not None:
-            motion_score = float(np.mean(np.abs(mouth_crop.astype(np.float32) - previous_mouth.astype(np.float32))) / 255.0)
+            crop_delta = float(np.mean(np.abs(mouth_crop.astype(np.float32) - previous_mouth.astype(np.float32))) / 255.0)
+            opening_delta = abs(lip_opening - previous_lip_opening) if previous_lip_opening is not None else 0.0
+            motion_score = clamp(0.62 * crop_delta + 0.38 * opening_delta * 4.0, 0.0, 1.0)
         previous_mouth = mouth_crop if mouth_box is not None else None
+        previous_mouth_box = mouth_box if mouth_box is not None else previous_mouth_box
+        previous_lip_opening = lip_opening if mouth_box is not None else previous_lip_opening
         rows.append(
             FrameSignal(
                 timestamp=float(index / fps if fps else 0.0),
@@ -1608,6 +2589,11 @@ def extract_sampled_frames(video_path: Path) -> list[FrameSignal]:
                 mouth_box=mouth_box,
                 motion_score=motion_score,
                 face_crop=crop_box(frame_rgb, face_box),
+                person_mask_ratio=person_stats["ratio"],
+                person_center_x=person_stats["center_x"],
+                person_center_y=person_stats["center_y"],
+                foreground_motion=person_stats["foreground_motion"],
+                background_motion=person_stats["background_motion"],
             )
         )
     capture.release()
@@ -1911,6 +2897,74 @@ def default_regions(face_box: tuple[int, int, int, int] | None, mouth_box: tuple
     return regions
 
 
+def normalize_detection_box(
+    box: tuple[int, int, int, int] | None,
+    *,
+    kind: str,
+    label: str,
+    confidence: float,
+) -> dict[str, Any] | None:
+    if box is None:
+        return None
+    x, y, w, h = box
+    if w <= 0 or h <= 0:
+        return None
+    return {
+        "kind": kind,
+        "label": label,
+        "x": round(clamp(float(x) / FRAME_SIZE * 100.0, 0.0, 100.0), 2),
+        "y": round(clamp(float(y) / FRAME_SIZE * 100.0, 0.0, 100.0), 2),
+        "width": round(clamp(float(w) / FRAME_SIZE * 100.0, 0.0, 100.0), 2),
+        "height": round(clamp(float(h) / FRAME_SIZE * 100.0, 0.0, 100.0), 2),
+        "confidence": round(clamp(confidence, 0.0, 1.0), 3),
+    }
+
+
+def build_detection_overlays(frame_signals: list[FrameSignal]) -> list[dict[str, Any]]:
+    overlays: list[dict[str, Any]] = []
+    for index, signal in enumerate(frame_signals):
+        boxes: list[dict[str, Any]] = []
+        person_box = mediapipe_person_box(signal.frame_rgb)
+        person = normalize_detection_box(
+            person_box,
+            kind="person",
+            label="인물 영역",
+            confidence=0.88 if person_box is not None else 0.0,
+        )
+        face = normalize_detection_box(
+            signal.face_box,
+            kind="face",
+            label="얼굴 감지",
+            confidence=0.94 if signal.face_box is not None else 0.0,
+        )
+        mouth = normalize_detection_box(
+            signal.mouth_box,
+            kind="mouth",
+            label="MediaPipe 입술",
+            confidence=0.93 if (mp is not None and signal.mouth_box is not None) else 0.78 if signal.mouth_box is not None else 0.0,
+        )
+        subtitle_confidence, subtitle_box = detect_subtitle_box(signal.frame_rgb)
+        # Subtitle OCR candidates are intentionally not drawn on the source overlay.
+        # The heuristic region was visually noisy, so subtitle confidence remains metadata only.
+        if person:
+            boxes.append(person)
+        if face:
+            boxes.append(face)
+        if mouth:
+            boxes.append(mouth)
+        overlays.append(
+            {
+                "label": f"샘플 프레임 {index + 1}",
+                "timestamp": round(float(signal.timestamp), 3),
+                "timeLabel": format_mmss(signal.timestamp),
+                "boxes": boxes,
+                "motionScore": round(float(signal.motion_score), 4),
+                "subtitleConfidence": round(float(subtitle_confidence), 3),
+            }
+        )
+    return overlays
+
+
 def build_regions_from_heatmap(
     heatmap: np.ndarray,
     face_box: tuple[int, int, int, int] | None,
@@ -2050,11 +3104,16 @@ def extract_multi_window_frames(video_path: Path) -> tuple[list[FrameSignal], li
             start_index = max(int(start_sec * fps), 0)
             end_index = max(int(end_sec * fps) - 1, start_index)
             target_indices.extend(np.linspace(start_index, end_index, count, dtype=int).tolist())
+        target_indices.append(representative_frame_index(frame_count, fps, duration))
+        target_indices = sorted(set(int(index) for index in target_indices))
     else:
         target_indices = [0]
 
     rows: list[FrameSignal] = []
     previous_mouth: np.ndarray | None = None
+    previous_mouth_box: tuple[int, int, int, int] | None = None
+    previous_lip_opening: float | None = None
+    previous_gray: np.ndarray | None = None
     for index in target_indices:
         capture.set(cv2.CAP_PROP_POS_FRAMES, int(index))
         ok, frame = capture.read()
@@ -2062,13 +3121,20 @@ def extract_multi_window_frames(video_path: Path) -> tuple[list[FrameSignal], li
             continue
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         frame_rgb = cv2.resize(frame_rgb, (FRAME_SIZE, FRAME_SIZE), interpolation=cv2.INTER_AREA)
+        person_stats = mediapipe_person_mask_stats(frame_rgb, previous_gray)
+        previous_gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
         face_box = detect_face_box(frame_rgb)
-        mouth_box = derive_mouth_box(face_box, frame_rgb)
+        mouth_box = derive_mouth_box(face_box, frame_rgb, previous_mouth_box)
         mouth_crop = crop_box(frame_rgb, mouth_box, size=96) if mouth_box is not None else np.zeros((96, 96, 3), dtype=np.uint8)
+        lip_opening = mediapipe_mouth_opening(frame_rgb) if mouth_box is not None else 0.0
         motion_score = 0.0
         if previous_mouth is not None and mouth_box is not None:
-            motion_score = float(np.mean(np.abs(mouth_crop.astype(np.float32) - previous_mouth.astype(np.float32))) / 255.0)
+            crop_delta = float(np.mean(np.abs(mouth_crop.astype(np.float32) - previous_mouth.astype(np.float32))) / 255.0)
+            opening_delta = abs(lip_opening - previous_lip_opening) if previous_lip_opening is not None else 0.0
+            motion_score = clamp(0.62 * crop_delta + 0.38 * opening_delta * 4.0, 0.0, 1.0)
         previous_mouth = mouth_crop if mouth_box is not None else None
+        previous_mouth_box = mouth_box if mouth_box is not None else previous_mouth_box
+        previous_lip_opening = lip_opening if mouth_box is not None else previous_lip_opening
         rows.append(
             FrameSignal(
                 timestamp=float(index / fps if fps else 0.0),
@@ -2077,6 +3143,11 @@ def extract_multi_window_frames(video_path: Path) -> tuple[list[FrameSignal], li
                 mouth_box=mouth_box,
                 motion_score=motion_score,
                 face_crop=crop_box(frame_rgb, face_box),
+                person_mask_ratio=person_stats["ratio"],
+                person_center_x=person_stats["center_x"],
+                person_center_y=person_stats["center_y"],
+                foreground_motion=person_stats["foreground_motion"],
+                background_motion=person_stats["background_motion"],
             )
         )
     capture.release()
@@ -2677,7 +3748,7 @@ def build_fusion_weights(selected_mode: str) -> list[dict[str, Any]]:
         "mm-frequency": [("Vision", 0.17), ("Text", 0.07), ("Temporal", 0.12), ("Audio", 0.15), ("Frequency", 0.37), ("Structure", 0.12)],
         "mm-scenegraph": [("Vision", 0.18), ("Text", 0.12), ("Temporal", 0.10), ("Audio", 0.08), ("Frequency", 0.10), ("Structure", 0.42)],
     }
-    weights = presets.get(selected_mode, presets["mm-flava"])
+    weights = presets.get(selected_mode, presets["mm-avsync"])
     return [{"label": label, "weight": weight} for label, weight in weights]
 
 
@@ -3380,7 +4451,7 @@ def analyze_image(image_path: Path, selected_mode: str, image_scope: str = "full
     full_rgb = cv2.resize(full_rgb, (FRAME_SIZE, FRAME_SIZE), interpolation=cv2.INTER_AREA)
     face_box = detect_face_box(full_rgb)
 
-    primary_rgb = crop_image_box(full_rgb, face_box if image_scope == "face-focus" else None)
+    primary_rgb = full_rgb
     precision_face_rgb = crop_image_box(full_rgb, face_box) if face_box is not None else primary_rgb.copy()
 
     rgb_tensor = transform(Image.fromarray(primary_rgb)).unsqueeze(0).to(device)
@@ -3559,86 +4630,55 @@ def analyze_image(image_path: Path, selected_mode: str, image_scope: str = "full
 
 
 def analyze_image_runtime(image_path: Path, selected_mode: str, image_scope: str = "full-scene") -> dict[str, Any]:
-    precision_model, precision_transform, device = ensure_image_model()
-    face_model, face_transform, _ = ensure_face_image_model()
-
+    state = ensure_image_v12_model()
     image = Image.open(image_path)
-    full_rgb = pil_to_rgb_array(image)
-    full_rgb = cv2.resize(full_rgb, (FRAME_SIZE, FRAME_SIZE), interpolation=cv2.INTER_AREA)
+    full_rgb_original = pil_to_rgb_array(image)
+    full_rgb = cv2.resize(full_rgb_original, (FRAME_SIZE, FRAME_SIZE), interpolation=cv2.INTER_AREA)
     face_box = detect_face_box(full_rgb)
 
     scene_rgb = full_rgb.copy()
     face_rgb = crop_image_box(full_rgb, face_box) if face_box is not None else scene_rgb.copy()
 
-    scene_rgb_tensor = precision_transform(Image.fromarray(scene_rgb)).unsqueeze(0).to(device)
-    scene_fft_map = compute_fft_map(cv2.cvtColor(scene_rgb, cv2.COLOR_RGB2GRAY))
-    scene_fft_tensor = fft_map_to_tensor(scene_fft_map, device)
-
-    with torch.no_grad():
-        scene_logit = precision_model(scene_rgb_tensor, scene_fft_tensor)
-        scene_real = float(torch.sigmoid(scene_logit).detach().cpu().item())
-        scene_fake = 1.0 - scene_real
-
-    precision_real = scene_real
-    precision_fake = scene_fake
-    if face_box is not None:
-        precision_face_rgb_tensor = precision_transform(Image.fromarray(face_rgb)).unsqueeze(0).to(device)
-        precision_face_fft_map = compute_fft_map(cv2.cvtColor(face_rgb, cv2.COLOR_RGB2GRAY))
-        precision_face_fft_tensor = fft_map_to_tensor(precision_face_fft_map, device)
-        with torch.no_grad():
-            precision_face_logit = precision_model(precision_face_rgb_tensor, precision_face_fft_tensor)
-            precision_face_real = float(torch.sigmoid(precision_face_logit).detach().cpu().item())
-        precision_real = float(scene_real * 0.42 + precision_face_real * 0.58)
-        precision_fake = 1.0 - precision_real
-
+    scene_pred = predict_image_v12(scene_rgb, state)
     face_model_available = face_box is not None
-    face_model_real = scene_real
-    face_model_fake = scene_fake
-    if face_model_available:
-        face_rgb_tensor = face_transform(Image.fromarray(face_rgb)).unsqueeze(0).to(device)
-        face_fft_map = compute_fft_map(cv2.cvtColor(face_rgb, cv2.COLOR_RGB2GRAY))
-        face_fft_tensor = face_transform(fft_map_to_rgb_image(face_fft_map)).unsqueeze(0).to(device)
-        with torch.no_grad():
-            face_logits = face_model(face_rgb_tensor, face_fft_tensor)
-            face_probs = torch.softmax(face_logits, dim=1).detach().cpu().numpy()[0]
-        face_model_fake = float(face_probs[0])
-        face_model_real = float(face_probs[1])
+    face_pred = predict_image_v12(face_rgb, state) if face_model_available else scene_pred
+
+    if image_scope == "face-focus" and face_model_available:
+        active_real = float(face_pred["real"])
+        active_visual = scene_rgb
+        active_model_label = "얼굴 중심 판별"
+        active_model_name = "얼굴 중심 이미지 판별"
+    elif selected_mode == "image-precision" and face_model_available:
+        active_real = float(scene_pred["real"] * 0.42 + face_pred["real"] * 0.58)
+        active_visual = scene_rgb
+        active_model_label = "정밀 이미지 판별"
+        active_model_name = "정밀 이미지 판별"
     else:
-        face_rgb_tensor = None
-        face_fft_tensor = None
-        face_fft_map = scene_fft_map
+        active_real = float(scene_pred["real"])
+        active_visual = scene_rgb
+        active_model_label = "전체 이미지 판별"
+        active_model_name = "전체 이미지 판별"
 
-    use_face_specialist = image_scope == "face-focus" and face_model_available
-    active_model_name = "류지호 얼굴 전용 모델" if use_face_specialist else "이원석 정밀 모델"
-    active_model_label = "Face-specialized branch" if use_face_specialist else "Precision branch"
-    active_real = face_model_real if use_face_specialist else precision_real
     active_fake = 1.0 - active_real
-    active_fft_map = face_fft_map if use_face_specialist else scene_fft_map
-    active_visual = face_rgb if use_face_specialist else scene_rgb
-    active_rgb_tensor = face_rgb_tensor if use_face_specialist else scene_rgb_tensor
-    active_fft_tensor = face_fft_tensor if use_face_specialist else scene_fft_tensor
-
+    active_fft_map = compute_fft_map(cv2.cvtColor(active_visual, cv2.COLOR_RGB2GRAY))
     clip_real, _clip_fake, _ = clip_real_fake(active_visual, "")
     fft_mean = float(np.mean(active_fft_map))
-    if use_face_specialist:
-        real_score = clamp(active_real * 0.72 + clip_real * 0.18 + (1.0 - fft_mean) * 0.10, 0.0, 1.0)
+
+    if selected_mode == "image-fast":
+        real_score = clamp(active_real * 0.86 + clip_real * 0.08 + (1.0 - fft_mean) * 0.06, 0.0, 1.0)
     elif selected_mode == "image-precision":
-        real_score = clamp(precision_real * 0.66 + clip_real * 0.22 + (1.0 - fft_mean) * 0.12, 0.0, 1.0)
+        real_score = clamp(active_real * 0.90 + clip_real * 0.06 + (1.0 - fft_mean) * 0.04, 0.0, 1.0)
     else:
-        real_score = clamp(scene_real * 0.58 + clip_real * 0.32 + (1.0 - fft_mean) * 0.10, 0.0, 1.0)
+        real_score = clamp(active_real * 0.88 + clip_real * 0.07 + (1.0 - fft_mean) * 0.05, 0.0, 1.0)
     fake_score = 1.0 - real_score
 
     fake_focus = fake_score >= real_score
-    if use_face_specialist and active_rgb_tensor is not None and active_fft_tensor is not None:
-        heatmap = gradcam_for_face_image_model(face_model, active_rgb_tensor, active_fft_tensor, fake_focus=fake_focus)
-    else:
-        heatmap = gradcam_for_image_model(precision_model, active_rgb_tensor, active_fft_tensor, fake_focus=fake_focus)
-    if float(heatmap.max()) <= 1e-6:
-        heatmap = clip_occlusion_heatmap(active_visual, fake_focus=fake_focus)
-    prior = roi_prior_heatmap(face_box if not use_face_specialist else (0, 0, FRAME_SIZE, FRAME_SIZE) if face_model_available else face_box, None)
+    heatmap = clip_occlusion_heatmap(active_visual, fake_focus=fake_focus)
+    prior_box = face_box
+    prior = roi_prior_heatmap(prior_box, None)
     if float(prior.max()) > 0:
-        heatmap = normalize_array(heatmap * 0.72 + prior * 0.28)
-    regions = build_regions_from_heatmap(heatmap, face_box if not use_face_specialist else None, None)
+        heatmap = normalize_array(heatmap * 0.76 + prior * 0.24)
+    regions = build_regions_from_heatmap(heatmap, face_box, None)
     focus_frame = render_focus_frame(active_visual, heatmap, regions)
     fft_map_url = fft_map_to_data_url(active_fft_map)
 
@@ -3659,26 +4699,26 @@ def analyze_image_runtime(image_path: Path, selected_mode: str, image_scope: str
         "textConfidence": 0.0,
     }
 
-    summary = "진본 콘텐츠일 가능성이 높게 평가되었습니다." if real_score >= fake_score else "합성 콘텐츠일 가능성이 높게 평가되었습니다."
+    summary = "최신 이미지 판별 모델이 진본 쪽 신호를 더 크게 반영했습니다." if real_score >= fake_score else "최신 이미지 판별 모델이 AI 생성 쪽 신호를 더 크게 반영했습니다."
     verdict = "Likely authentic" if real_score >= fake_score else "Likely synthetic"
     confidence = int(round(abs(real_score - fake_score) * 100))
 
     fusion_weights = [
-        {"label": active_model_label, "weight": 56 if use_face_specialist else 44 if selected_mode == "image-precision" else 52},
-        {"label": "OpenCLIP scene prior", "weight": 18 if use_face_specialist else 22 if selected_mode == "image-precision" else 32},
-        {"label": "FFT reference", "weight": 10 if use_face_specialist else 12 if selected_mode == "image-precision" else 10},
-        {"label": "Face refinement", "weight": 16 if face_box is not None and not use_face_specialist else 0},
+        {"label": active_model_label, "weight": 82},
+        {"label": "OpenCLIP scene prior", "weight": 8 if selected_mode == "image-fast" else 6},
+        {"label": "FFT reference", "weight": 6 if selected_mode == "image-fast" else 4},
+        {"label": "Face crop route", "weight": 8 if face_model_available and selected_mode == "image-precision" else 0},
     ]
 
     frequency_note = (
-        "현재 이미지의 FFT 분포를 기준으로 일반적인 real 이미지 경향과 synthetic 이미지 경향을 함께 비교합니다. "
-        "중심 저주파는 자연 영상에서도 강하지만, 축 방향 잔여와 고주파 분포가 과도하게 두드러지면 합성 단서로 더 강하게 해석합니다."
+        "현재 이미지는 모델 판정 이후 주파수 분포를 보조 근거로 함께 표시합니다. "
+        "고주파 잔여와 경계 패턴이 강할수록 생성 이미지 의심 신호로 해석할 수 있지만, 최종 판정은 이미지 내용, 주파수 패턴, 시각적 의미 특징을 함께 본 모델 점수를 중심으로 계산됩니다."
     )
 
     face_reason = (
-        "얼굴 전용 경로에서 류지호 모델이 얼굴 crop과 FFT를 함께 읽었습니다."
+        "얼굴이 감지되어 얼굴 중심 영역도 함께 확인했습니다."
         if face_model_available
-        else "얼굴이 안정적으로 검출되지 않아 얼굴 전용 경로는 gated down 되었고 장면 기준 판단으로 대체했습니다."
+        else "얼굴이 안정적으로 감지되지 않아 전체 이미지 기준 판정을 사용했습니다."
     )
 
     return {
@@ -3690,35 +4730,35 @@ def analyze_image_runtime(image_path: Path, selected_mode: str, image_scope: str
         "confidence": confidence,
         "summary": summary,
         "reasoning": [
-            {"title": active_model_name, "body": "정밀 경로에서는 RGB+FFT 이중 스트림을 사용하고, 얼굴 전용 경로에서는 얼굴 crop 기준의 late-fusion 판단을 수행합니다."},
-            {"title": "주파수 근거", "body": "FFT 분포를 기준으로 저주파 중심 구조와 고주파 잔여 패턴을 함께 비교합니다."},
-            {"title": "시각적 근거", "body": "Grad-CAM 스타일 heatmap으로 현재 판정에서 반응이 컸던 영역을 강조했습니다."},
+            {"title": "최신 이미지 판별 모델", "body": "최신 이미지 모델은 화면의 시각 특징, 주파수 패턴, 의미적 시각 단서를 함께 반영해 Real/Fake를 판정합니다."},
+            {"title": "동일 모델 라우팅", "body": "빠른 분석, 정밀 분석, 얼굴 초점 분석 모두 동일한 최신 이미지 판별 기준을 사용하며, 정밀 모드에서는 얼굴 중심 영역을 추가로 반영합니다."},
+            {"title": "설명 가능한 보조 근거", "body": "표시되는 heat trace는 occlusion 반응과 얼굴 위치 prior를 결합한 설명용 지도이며, 모델의 직접적인 Grad-CAM 값은 아닙니다."},
         ],
         "metrics": [
             {"label": "Real score", "value": f"{real_score * 100:.1f}%", "detail": "image authenticity confidence"},
             {"label": "Fake score", "value": f"{fake_score * 100:.1f}%", "detail": "synthetic likelihood"},
-            {"label": "Model route", "value": "류지호 face" if use_face_specialist else "이원석 precision", "detail": "active primary checkpoint"},
+            {"label": "Model route", "value": active_model_label, "detail": "active image analysis route"},
             {"label": "Confidence", "value": f"{confidence}%", "detail": "single-modal certainty"},
         ],
         "stages": [
-            {"title": "Image ingest", "body": "입력 이미지를 정규화하고 얼굴 존재 여부를 먼저 확인했습니다."},
-            {"title": "Model route", "body": "전체 장면이면 이원석 모델, 얼굴 전용이면 류지호 모델을 우선 사용하도록 경로를 분기했습니다."},
-            {"title": "Dual-stream inference", "body": "RGB 단서와 FFT 주파수 단서를 함께 반영해 판정 점수를 계산했습니다."},
-            {"title": "Explainable evidence", "body": "heatmap과 FFT 맵을 함께 생성해 어떤 근거가 사용됐는지 시각화했습니다."},
+            {"title": "Image ingest", "body": "입력 이미지를 RGB로 정규화하고 분석 크기에 맞게 변환했습니다."},
+            {"title": "Image preprocessing", "body": "이미지 입력을 정규화하고 주파수 패턴과 시각 의미 단서를 계산했습니다."},
+            {"title": "Integrated image inference", "body": "여러 이미지 단서를 통합해 Real/Fake 확률을 계산했습니다."},
+            {"title": "XAI summary", "body": "occlusion 기반 반응 지도와 주파수 분포를 함께 표시해 사용자가 의심 근거를 해석할 수 있게 했습니다."},
         ],
-        "xaiHeadline": "이원석 정밀 모델과 류지호 얼굴 전용 모델 중 현재 경로에 맞는 체크포인트를 사용해 최종 판정 값을 산출했습니다.",
+        "xaiHeadline": "이미지 최종 판정과 보조 시각 근거를 함께 표시합니다.",
         "modalityJudgments": [
             {
-                "label": "이원석 precision",
-                "realPercent": round(precision_real * 100, 1),
-                "fakePercent": round(precision_fake * 100, 1),
-                "verdict": "진본 우세" if precision_fake < 0.5 else "합성 우세",
-                "reason": "RGB+FFT 이중 스트림으로 전체 장면과 얼굴 재판독 단서를 함께 반영했습니다.",
+                "label": "전체 이미지",
+                "realPercent": round(scene_pred["real"] * 100, 1),
+                "fakePercent": round(scene_pred["fake"] * 100, 1),
+                "verdict": "진본 우세" if scene_pred["real"] >= scene_pred["fake"] else "생성 우세",
+                "reason": "전체 이미지를 시각 특징, 주파수 패턴, 의미 단서 기준으로 분석한 기본 판정입니다.",
             },
             {
-                "label": "류지호 face",
-                "realPercent": round(face_model_real * 100, 1) if face_model_available else 0.0,
-                "fakePercent": round(face_model_fake * 100, 1) if face_model_available else 0.0,
+                "label": "얼굴 중심 영역",
+                "realPercent": round(face_pred["real"] * 100, 1) if face_model_available else 0.0,
+                "fakePercent": round(face_pred["fake"] * 100, 1) if face_model_available else 0.0,
                 "verdict": "활성" if face_model_available else "gated down",
                 "reason": face_reason,
             },
@@ -3726,19 +4766,19 @@ def analyze_image_runtime(image_path: Path, selected_mode: str, image_scope: str
                 "label": "FFT branch",
                 "realPercent": round((1.0 - fft_strength) * 100, 1),
                 "fakePercent": round(fft_strength * 100, 1),
-                "verdict": "진본 우세" if fft_strength < 0.5 else "합성 우세",
-                "reason": "주파수 분포에서 중심 저주파와 축 방향 잔여 패턴을 기준으로 비교했습니다.",
+                "verdict": "보조 근거",
+                "reason": "주파수 분포는 최종 판정의 직접 점수가 아니라 판정을 해석하기 위한 보조 시각 자료입니다.",
             },
         ],
         "fusionSteps": [
-            {"title": "Pre-check", "weight": "face-aware", "logic": "얼굴이 검출되면 얼굴 전용 모델 경로를 활성화하고, 없으면 장면 기준 모델로 유지합니다."},
-            {"title": "Checkpoint route", "weight": active_model_name, "logic": "정밀 버전은 이원석 모델, 얼굴 전용 초점은 류지호 모델이 주 분기를 담당합니다."},
-            {"title": "Final image verdict", "weight": "single-modal", "logic": "활성 모델 점수, FFT 기준, OpenCLIP 장면 prior를 결합해 최종 이미지를 판정합니다."},
+            {"title": "Route", "weight": "latest", "logic": "모든 이미지 분석 모드는 동일한 최신 이미지 판별 모델을 사용합니다."},
+            {"title": "Feature fusion", "weight": "visual + frequency + semantic", "logic": "이미지 내용, 주파수 잔여, 시각 임베딩을 결합해 최종 확률을 계산합니다."},
+            {"title": "Final image verdict", "weight": "single-modal", "logic": "이미지 모델 확률을 중심으로 시각 의미 단서와 주파수 보조 신호를 함께 반영합니다."},
         ],
         "modelTraits": [
-            {"model": "이원석 모델", "role": "정밀 판독", "trait": "RGB 장면 단서와 FFT 주파수 단서를 이중 스트림으로 결합합니다.", "contribution": "정밀 버전에서 전체 장면과 얼굴 재판독을 함께 반영합니다."},
-            {"model": "류지호 모델", "role": "얼굴 전용 판독", "trait": "얼굴 crop 중심 late-fusion 구조로 표정, 피부 질감, 주파수 잔여를 읽습니다.", "contribution": "얼굴 전용 초점에서 가장 먼저 반영되는 체크포인트입니다."},
-            {"model": "FFT branch", "role": "주파수 단서", "trait": "중심 저주파와 고주파 잔여 패턴의 편차를 비교합니다.", "contribution": "실제/합성 주파수 기준과 현재 이미지를 비교하는 보조 근거를 제공합니다."},
+            {"model": "최신 이미지 판별 모델", "role": "최종 이미지 판정", "trait": "시각 특징, 주파수 패턴, 의미적 시각 단서를 결합해 판정합니다.", "contribution": "빠른/정밀/얼굴 초점 이미지 분석의 공통 체크포인트로 사용됩니다."},
+            {"model": "Face crop route", "role": "정밀 보조", "trait": "얼굴이 감지되면 얼굴 중심 영역도 추가로 확인합니다.", "contribution": "얼굴 중심 이미지에서 국소적 생성 흔적을 추가 반영합니다."},
+            {"model": "FFT reference", "role": "주파수 설명", "trait": "고주파 잔여와 경계 패턴의 분포를 시각화합니다.", "contribution": "판정 보조 자료로 표시되며 단독 증거로 사용하지 않습니다."},
         ],
         "spectrumBins": sample_profile,
         "syncBins": [],
@@ -3751,22 +4791,21 @@ def analyze_image_runtime(image_path: Path, selected_mode: str, image_scope: str
             "note": frequency_note,
             "sampleImage": fft_map_url,
         },
-        "gatedBranches": [] if face_model_available or not use_face_specialist else ["류지호 face"],
+        "gatedBranches": [] if face_model_available else ["얼굴 중심 영역"],
         "xai": {
-            "headline": "이미지 전용 XAI는 현재 활성 모델 경로의 heatmap과 FFT 맵을 함께 보여줍니다.",
+            "headline": "이미지 XAI는 최종 판정 점수, 반응 지도, 주파수 분포를 함께 보여줍니다.",
             "regions": regions,
             "timeline": [],
             "textHighlights": [],
             "modalityBars": [
                 {"label": active_model_label, "score": active_fake, "note": active_model_name},
-                {"label": "OpenCLIP prior", "score": 1.0 - clip_real, "note": "scene-text alignment prior"},
-                {"label": "FFT branch", "score": fft_strength, "note": "frequency residue / low-high balance"},
+                {"label": "OpenCLIP prior", "score": 1.0 - clip_real, "note": "scene visual prior"},
+                {"label": "FFT reference", "score": fft_strength, "note": "frequency residue / low-high balance"},
                 {"label": "Overall", "score": fake_score, "note": "final synthetic likelihood"},
             ],
             "focusFrame": focus_frame,
         },
     }
-
 
 def make_video_transform(image_size: int) -> T.Compose:
     return T.Compose(
@@ -3831,6 +4870,48 @@ def apply_video_text_mask(rgb_np: np.ndarray) -> np.ndarray:
     return out
 
 
+def render_video_text_mask_preview(rgb_np: np.ndarray) -> np.ndarray:
+    out = apply_video_text_mask(rgb_np)
+    h, w = out.shape[:2]
+    top = int(round(h * 0.08))
+    bottom = int(round(h * 0.18))
+    guide = np.array([0, 214, 255], dtype=np.uint8)
+    person_box = None
+    face_box = None
+    try:
+        person_box = mediapipe_person_box(rgb_np)
+    except Exception:
+        person_box = None
+    try:
+        face_box = detect_face_box(rgb_np)
+    except Exception:
+        face_box = None
+
+    if top > 0:
+        band = out[:top].astype(np.float32)
+        out[:top] = np.clip(band * 0.68 + guide.astype(np.float32) * 0.32, 0, 255).astype(np.uint8)
+        cv2.rectangle(out, (0, 0), (w - 1, max(top - 1, 0)), (0, 214, 255), 2)
+        cv2.line(out, (0, max(top - 1, 0)), (w - 1, max(top - 1, 0)), (255, 255, 255), 1)
+
+    if bottom > 0:
+        start = max(h - bottom, 0)
+        band = out[start:].astype(np.float32)
+        out[start:] = np.clip(band * 0.68 + guide.astype(np.float32) * 0.32, 0, 255).astype(np.uint8)
+        cv2.rectangle(out, (0, start), (w - 1, h - 1), (0, 214, 255), 2)
+        cv2.line(out, (0, start), (w - 1, start), (255, 255, 255), 1)
+
+    if person_box is not None:
+        x, y, bw, bh = person_box
+        cv2.rectangle(out, (max(x, 0), max(y, 0)), (min(x + bw, w - 1), min(y + bh, h - 1)), (0, 214, 255), 3)
+        cv2.putText(out, "PERSON", (max(x, 0) + 4, max(y, 18)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 214, 255), 2, cv2.LINE_AA)
+    if face_box is not None:
+        x, y, bw, bh = face_box
+        cv2.rectangle(out, (max(x, 0), max(y, 0)), (min(x + bw, w - 1), min(y + bh, h - 1)), (255, 255, 255), 2)
+        cv2.putText(out, "FACE", (max(x, 0) + 4, max(y, 18)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2, cv2.LINE_AA)
+
+    return out
+
+
 def sample_video_ensemble_frames(video_path: Path, n_frames: int = VIDEO_SAMPLE_FRAMES) -> tuple[list[dict[str, Any]], dict[str, float]]:
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
@@ -3840,7 +4921,10 @@ def sample_video_ensemble_frames(video_path: Path, n_frames: int = VIDEO_SAMPLE_
         fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
         if total <= 0:
             raise RuntimeError("video has no readable frames")
-        indices = np.linspace(0, total - 1, n_frames).astype(int)
+        duration = float(total / fps) if fps > 0 else 0.0
+        indices = np.linspace(0, total - 1, n_frames).astype(int).tolist()
+        indices.append(representative_frame_index(total, fps, duration))
+        indices = sorted(set(int(index) for index in indices))
         frames: list[dict[str, Any]] = []
         for order, index in enumerate(indices):
             capture.set(cv2.CAP_PROP_POS_FRAMES, int(index))
@@ -3934,6 +5018,31 @@ def predict_video_ensemble(video_path: Path) -> dict[str, Any]:
     }
 
 
+def select_video_focus_frame(per_frame: list[dict[str, Any]], is_generated: bool) -> dict[str, Any]:
+    if not per_frame:
+        raise RuntimeError("no per-frame predictions available")
+    candidates = [item for item in per_frame if float(item.get("timestamp") or 0.0) >= REPRESENTATIVE_FRAME_SECONDS - 0.15]
+    candidates = candidates or per_frame
+
+    def focus_score(item: dict[str, Any]) -> tuple[float, float, float, float, float]:
+        rgb = item.get("rgb")
+        face_score = 0.0
+        person_score = 0.0
+        if isinstance(rgb, np.ndarray) and rgb.size:
+            try:
+                probe_rgb = cv2.resize(rgb, (FRAME_SIZE, FRAME_SIZE), interpolation=cv2.INTER_AREA)
+                person_score = float(box_area(mediapipe_person_box(probe_rgb)))
+                face_score = float(box_area(detect_face_box(probe_rgb)))
+            except Exception:
+                person_score = 0.0
+                face_score = 0.0
+        target_score = float(item["pGen"] if is_generated else item["pReal"])
+        timestamp_bonus = 1.0 if float(item.get("timestamp") or 0.0) >= REPRESENTATIVE_FRAME_SECONDS - 0.15 else 0.0
+        return (timestamp_bonus, person_score, face_score, target_score, float(item.get("weight") or 0.0))
+
+    return max(candidates, key=focus_score)
+
+
 def build_video_processing_scope(prediction: dict[str, Any]) -> dict[str, Any]:
     video_meta = prediction["videoMeta"]
     per_frame = prediction["perFrame"]
@@ -3971,9 +5080,9 @@ def analyze_video_ensemble(video_path: Path) -> dict[str, Any]:
     is_generated = p_gen > 0.5
     verdict_label = "Likely generated" if is_generated else "Likely authentic"
     confidence = int(round(max(p_gen, p_real) * 100))
-    top_frame = max(prediction["perFrame"], key=lambda item: item["pGen"] if is_generated else item["pReal"])
-    focus_frame = rgb_array_to_data_url(top_frame["rgb"], fmt="JPEG")
-    masked_focus_frame = rgb_array_to_data_url(apply_video_text_mask(top_frame["rgb"]), fmt="JPEG")
+    top_frame = select_video_focus_frame(prediction["perFrame"], is_generated)
+    original_focus_frame = rgb_array_to_data_url(top_frame["rgb"], fmt="JPEG")
+    masked_focus_frame = rgb_array_to_data_url(render_video_text_mask_preview(top_frame["rgb"]), fmt="JPEG")
     per_model_sorted = sorted(prediction["perModel"], key=lambda item: item["pGen"], reverse=True)
 
     timeline = []
@@ -4126,6 +5235,7 @@ def analyze_video_ensemble(video_path: Path) -> dict[str, Any]:
             "topFrameLabel": str(top_frame["label"]),
             "consensus": consensus,
             "interpretation": interpretation,
+            "originalFocusFrame": original_focus_frame,
             "maskedFocusFrame": masked_focus_frame,
         },
         "xai": {
@@ -4136,7 +5246,7 @@ def analyze_video_ensemble(video_path: Path) -> dict[str, Any]:
             "modalityBars": model_bars + [
                 {"label": "Final ensemble", "score": round(float(p_gen), 4), "note": "median per frame + confidence_mean across frames"},
             ],
-            "focusFrame": focus_frame,
+            "focusFrame": masked_focus_frame,
         },
         "debug": {
             "topGeneratedModels": [item["label"] for item in per_model_sorted[:3]],
@@ -4158,16 +5268,7 @@ def analyze_multimodal(video_path: Path, selected_mode: str, companion_text: str
         audio_env, _spectral_flatness, mel_energy = audio_features(audio, sr, len(frame_signals))
         sync_score, lag = motion_audio_sync(motion_series, audio_env)
 
-        representative = max(frame_signals, key=lambda row: (box_area(row.face_box), row.motion_score))
-        if box_area(representative.face_box) == 0:
-            representative = frame_signals[len(frame_signals) // 2]
-        if availability["hasLips"]:
-            lip_candidates = [row for row in frame_signals if row.mouth_box is not None]
-            if lip_candidates:
-                representative = max(
-                    lip_candidates,
-                    key=lambda row: (box_area(row.mouth_box), row.motion_score, box_area(row.face_box)),
-                )
+        representative = select_representative_face_frame(frame_signals)
 
         real_prob, openclip_fake_prob, text_alignment = clip_real_fake(representative.face_crop, companion_text)
         frequency_source = [row.face_crop for row in frame_signals] if availability["hasFace"] else [row.frame_rgb for row in frame_signals]
@@ -4175,6 +5276,7 @@ def analyze_multimodal(video_path: Path, selected_mode: str, companion_text: str
 
         face_centers = []
         face_areas = []
+        mouth_areas = []
         sharpness_scores = []
         face_hits = []
         mouth_hits = []
@@ -4187,6 +5289,9 @@ def analyze_multimodal(video_path: Path, selected_mode: str, companion_text: str
                 x, y, w, h = row.face_box
                 face_centers.append(((x + w / 2) / FRAME_SIZE, (y + h / 2) / FRAME_SIZE))
                 face_areas.append((w * h) / float(FRAME_SIZE * FRAME_SIZE))
+            if row.mouth_box is not None:
+                mx, my, mw, mh = row.mouth_box
+                mouth_areas.append((mw * mh) / float(FRAME_SIZE * FRAME_SIZE))
 
         if face_centers:
             center_arr = np.array(face_centers, dtype=np.float32)
@@ -4217,6 +5322,12 @@ def analyze_multimodal(video_path: Path, selected_mode: str, companion_text: str
         audio_energy_std = float(np.std(audio_env)) if len(audio_env) else 0.0
         motion_mean = float(np.mean(motion_series)) if len(motion_series) else 0.0
         duration_sec = float(max((frame_signals[-1].timestamp if frame_signals else 0.0), sampling_windows[-1][2] if sampling_windows else 0.0))
+        person_segmentation_features = build_person_segmentation_runtime_features(
+            frame_signals,
+            face_areas,
+            face_jitter,
+            mouth_areas,
+        )
 
         runtime_frame = pd.DataFrame(
             [
@@ -4236,6 +5347,7 @@ def analyze_multimodal(video_path: Path, selected_mode: str, companion_text: str
                     "audio_energy_mean": audio_energy_mean,
                     "audio_energy_std": audio_energy_std,
                     "motion_mean": motion_mean,
+                    **person_segmentation_features,
                 }
             ]
         )
@@ -4264,7 +5376,14 @@ def analyze_multimodal(video_path: Path, selected_mode: str, companion_text: str
             "frequency": float(runtime_frame["prob_fake_frequency"].iloc[0]),
             "scenegraph": float(runtime_frame["prob_fake_scenegraph"].iloc[0]),
         }
-        final8000_score, final8000_weights = compute_final8000_fusion_score(model_scores)
+        segmentation_runtime_active = any(
+            column in runtime_bundle.get("fusion_feature_names", [])
+            for column in SEGMENTATION_FEATURE_COLUMNS
+        )
+        if segmentation_runtime_active:
+            final8000_score, final8000_weights = None, {}
+        else:
+            final8000_score, final8000_weights = compute_final8000_fusion_score(model_scores)
         fusion_score = final8000_score if final8000_score is not None else predict_runtime_fusion(runtime_bundle, runtime_frame)
         if final8000_weights:
             adjusted_weights = final8000_weights
@@ -4361,6 +5480,7 @@ def analyze_multimodal(video_path: Path, selected_mode: str, companion_text: str
                 "modalityBars": modality_bars,
                 "focusFrame": focus_frame,
                 "mouthPreview": mouth_preview,
+                "detectionOverlays": build_detection_overlays(frame_signals),
             },
         }
     finally:
@@ -4513,16 +5633,24 @@ class MultimodalHandler(BaseHTTPRequestHandler):
                 length = int(self.headers.get("Content-Length", "0"))
                 payload = json.loads(self.rfile.read(length).decode("utf-8"))
                 remote_url = validate_remote_video_url(str(payload.get("url") or ""))
-                selected_mode = normalize_selected_mode(str(payload.get("selectedMode") or "mm-flava"))
+                selected_mode = normalize_selected_mode(str(payload.get("selectedMode") or "mm-avsync"))
                 settings = payload.get("settings") or {}
                 companion_text = str(settings.get("companionText") or "").strip()
                 inference_mode = str(settings.get("inferenceMode") or "ensemble").strip().lower()
                 if inference_mode not in {"ensemble", "single"}:
                     inference_mode = "ensemble"
 
+                source_metadata = fetch_public_video_metadata(remote_url)
                 download_dir = Path(tempfile.mkdtemp(prefix="isy_mm_remote_"))
                 video_path = download_remote_video(remote_url, download_dir)
                 analysis = analyze_multimodal(video_path, selected_mode, companion_text, inference_mode)
+                analysis = apply_source_prior_to_analysis(
+                    analysis,
+                    remote_url,
+                    profile="multimodal",
+                    video_path=video_path,
+                    source_metadata=source_metadata,
+                )
                 json_response(
                     self,
                     {
@@ -4548,9 +5676,17 @@ class MultimodalHandler(BaseHTTPRequestHandler):
                 length = int(self.headers.get("Content-Length", "0"))
                 payload = json.loads(self.rfile.read(length).decode("utf-8"))
                 remote_url = validate_remote_video_url(str(payload.get("url") or ""))
+                source_metadata = fetch_public_video_metadata(remote_url)
                 download_dir = Path(tempfile.mkdtemp(prefix="isy_video_remote_"))
                 video_path = download_remote_video(remote_url, download_dir)
                 analysis = analyze_video_ensemble(video_path)
+                analysis = apply_source_prior_to_analysis(
+                    analysis,
+                    remote_url,
+                    profile="video",
+                    video_path=video_path,
+                    source_metadata=source_metadata,
+                )
                 json_response(
                     self,
                     {
@@ -4594,7 +5730,7 @@ class MultimodalHandler(BaseHTTPRequestHandler):
             if not getattr(file_item, "filename", ""):
                 raise ValueError("file is required")
 
-            raw_mode = str(form.getvalue("selectedMode") or "mm-flava")
+            raw_mode = str(form.getvalue("selectedMode") or "mm-avsync")
             selected_mode = raw_mode if self.path in {"/analyze-image", "/analyze-video"} else normalize_selected_mode(raw_mode)
             settings_raw = str(form.getvalue("settings") or "{}")
             settings = json.loads(settings_raw) if settings_raw else {}
